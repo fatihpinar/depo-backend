@@ -1,7 +1,22 @@
 // src/services/inventoryService.js
 const pool = require('../config/db');
 
-exports.list = async ({ warehouseId=null, locationId=null, statusId=null, type='all', search='', limit=50, offset=0 }) => {
+// src/services/inventoryService.js
+exports.list = async ({
+  warehouseId = null,
+  locationId = null,
+  statusId = null,
+  type = 'all',
+  search = '',
+  limit = 50,
+  offset = 0,
+  inStockOnly = false, // <- yeni opsiyon
+}) => {
+  // Eğer inStockOnly aktifse, statusId yoksa 1'e sabitle
+  if (inStockOnly && (statusId === null || statusId === undefined || statusId === '')) {
+    statusId = 1;
+  }
+
   const params = [];
   const push = v => { params.push(v); return `$${params.length}`; };
 
@@ -45,7 +60,6 @@ exports.list = async ({ warehouseId=null, locationId=null, statusId=null, type='
     JOIN statuses st ON st.id = p.status_id
     LEFT JOIN warehouses w ON w.id = p.warehouse_id
     LEFT JOIN locations  l ON l.id = p.location_id
-    -- NOT: status burada sabitlenmiyor; dışarıdaki filtre çalışacak
   )`;
 
   let where = `WHERE 1=1`;
@@ -58,10 +72,8 @@ exports.list = async ({ warehouseId=null, locationId=null, statusId=null, type='
     where += ` AND (inv.barcode ILIKE ${push(term)} OR inv.name ILIKE ${push(term)})`;
   }
 
-  // filtre parametrelerini kopyala
   const filterParams = [...params];
 
-  // DATA
   const dataParams = [...filterParams];
   const pushData = v => { dataParams.push(v); return `$${dataParams.length}`; };
 
@@ -72,7 +84,6 @@ exports.list = async ({ warehouseId=null, locationId=null, statusId=null, type='
     LIMIT ${pushData(limit)} OFFSET ${pushData(offset)}
   `;
 
-  // COUNT
   const countSql = `SELECT COUNT(*)::int AS total FROM (${unionSql}) inv ${where}`;
 
   const [rowsRes, countRes] = await Promise.all([
@@ -82,3 +93,4 @@ exports.list = async ({ warehouseId=null, locationId=null, statusId=null, type='
 
   return { rows: rowsRes.rows, total: countRes.rows[0].total };
 };
+
