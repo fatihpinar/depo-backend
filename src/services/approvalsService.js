@@ -2,6 +2,7 @@
 const pool = require("../config/db");
 const { recordTransitions, makeBatchId } = require("./inventoryTransitionsService");
 const { ITEM_TYPE, ACTION } = require("../constants/transitions");
+const { assertFormatAndKind, assertAndConsume } = require("./barcodeService"); // ✅ EKLENDİ
 
 // DB status ids
 const STATUS = {
@@ -14,19 +15,15 @@ const STATUS = {
   screenprint: 7,
 };
 
-// Hangi scope hangi status listesini getirir?
 const LIST_STATUS_BY_SCOPE = {
   stock: STATUS.pending,
   production: STATUS.production,
   screenprint: STATUS.screenprint,
 };
 
-// Scope → kendi departmanı
 const DEPT_BY_SCOPE = { production: "production", screenprint: "screenprint" };
 
-/* ------------------------------------------------------------------ */
-/* LISTE: scope'a göre bekleyen işler                                 */
-/* ------------------------------------------------------------------ */
+/* ---------------- LIST ---------------- */
 exports.listPending = async ({ scope = "stock", limit = 100, offset = 0, search = "" } = {}) => {
   const statusToList = LIST_STATUS_BY_SCOPE[scope];
   if (!statusToList) return [];
@@ -40,6 +37,7 @@ exports.listPending = async ({ scope = "stock", limit = 100, offset = 0, search 
       'component' AS kind,
       c.id,
       c.barcode,
+      m.id AS master_id,
       COALESCE(m.display_label, CONCAT('#', m.id)) AS display_label,
       c.unit,
       CASE WHEN c.unit='EA' THEN 1 ELSE c.quantity END AS quantity,
@@ -58,6 +56,7 @@ exports.listPending = async ({ scope = "stock", limit = 100, offset = 0, search 
       'product' AS kind,
       p.id,
       p.barcode,
+      m.id AS master_id,
       COALESCE(m.display_label, CONCAT('#', m.id)) AS display_label,
       m.default_unit AS unit,
       1 AS quantity,
@@ -88,28 +87,25 @@ exports.listPending = async ({ scope = "stock", limit = 100, offset = 0, search 
 
   return rows.map((r) => ({
     id: r.id,
-    kind: r.kind, // "component" | "product"
+    kind: r.kind,
     barcode: r.barcode,
     unit: r.unit,
     quantity: r.quantity,
     width: r.width,
     height: r.height,
-    master: { id: 0, display_label: r.display_label },
+    master: { id: r.master_id, display_label: r.display_label },
     warehouse_id: r.warehouse_id,
     location_id: r.location_id,
   }));
 };
 
-/* ------------------------------------------------------------------ */
-/* ONAY / TAMAMLAMA: tek endpoint                                      */
-/*  - stock: pending -> in_stock                                       */
-/*  - production/screenprint:                                          */
-/*      depo departmanı scope’la eşleşiyorsa -> in_stock               */
-/*      değilse -> pending (depo onayına düşsün)                       */
-/*  - TRANSITIONS:                                                     */
-/*      * Depo/Lokasyon değişirse: önce MOVE, sonra APPROVE            */
-/*      * Değişmiyorsa: yalnız APPROVE (sadece statü değişimi)         */
-/* ------------------------------------------------------------------ */
+/* ---------------- APPROVE ----------------
+   Kurallar:
+   - toStatus === in_stock ise barkod ZORUNLU ve formata uymalı
+   - barkod değişiyorsa/ilk kez atanıyorsa:
+       * aynı tabloda çakışma kontrolü
+       * barcode_pool -> assertAndConsume (kullanıldı olarak işaretle)
+------------------------------------------*/
 exports.approveItems = async (scope = "stock", items = []) => {
   if (!["stock", "production", "screenprint"].includes(scope)) {
     const e = new Error("UNSUPPORTED_SCOPE"); e.status = 400; throw e;
@@ -136,9 +132,9 @@ exports.approveItems = async (scope = "stock", items = []) => {
         it.kind === "product"   ? "products"   : null;
       if (!table) { const e = new Error("INVALID_KIND"); e.status = 400; throw e; }
 
-      // Kayıt kilitle ve mevcut bilgileri al
+      // Kayıt kilitle + önceki değerler
       const lockRes = await client.query(
-        `SELECT id, status_id, warehouse_id, location_id, ${table === "components" ? "unit" : "NULL::text AS unit"} 
+        `SELECT id, barcode, status_id, warehouse_id, location_id, ${table === "components" ? "unit" : "NULL::text AS unit"} 
          FROM ${table} WHERE id=$1 FOR UPDATE`,
         [id]
       );
@@ -152,12 +148,11 @@ exports.approveItems = async (scope = "stock", items = []) => {
       const prevLc = Number(prev.location_id || 0);
       const unit = prev.unit || it.unit || "EA";
 
-      // Hedef statü hesapla
+      // Hedef statü
       let toStatus;
       if (scope === "stock") {
         toStatus = STATUS.in_stock;
       } else {
-        // üretim/serigrafi: deponun departmanına bak
         const wr = await client.query(`SELECT department FROM warehouses WHERE id=$1`, [wh]);
         if (!wr.rows.length) { const e = new Error("WAREHOUSE_NOT_FOUND"); e.status = 404; throw e; }
         const dept = wr.rows[0].department; // general | production | screenprint
@@ -165,20 +160,76 @@ exports.approveItems = async (scope = "stock", items = []) => {
         toStatus = (dept === ownDept) ? STATUS.in_stock : STATUS.pending;
       }
 
+      // Barkod doğrulama / zorunluluk
+      const incoming = String(it.barcode || "").trim().toUpperCase();
+      const current  = String(prev.barcode || "").trim().toUpperCase();
+      const nextBarcode = incoming || current;
+
+      if (toStatus === STATUS.in_stock) {
+        if (!nextBarcode) {
+          const e = new Error("BARCODE_REQUIRED"); e.status = 400; throw e;
+        }
+        // format/kind
+        assertFormatAndKind(nextBarcode, it.kind);
+      } else {
+        // pending'e düşecekse ama barkod geldiyse format yine kontrol edilebilir (opsiyonel)
+        if (nextBarcode) assertFormatAndKind(nextBarcode, it.kind);
+      }
+
+      // Barkod değişiyor mu? (ilk atama veya farklı değere geçiş)
+      const changingBarcode = !!nextBarcode && nextBarcode !== current;
+
+      if (changingBarcode) {
+        // tablo çakışması
+        const hit = await client.query(
+          `SELECT 1 FROM ${table} WHERE barcode=$1 AND id<>$2 LIMIT 1`,
+          [nextBarcode, id]
+        );
+        if (hit.rows.length) {
+          const err = new Error("BARCODE_CONFLICT"); err.status = 409; throw err;
+        }
+
+        // havuzdan tüket
+        await assertAndConsume(client, {
+          code: nextBarcode,
+          kind: it.kind,
+          refTable: table,
+          refId: id,
+        });
+      }
+
       // Depo/Lokasyon değişti mi?
       const willMove = (prevWh !== wh) || (prevLc !== lc);
 
-      // UPDATE (hedef statü + hedef depo/lokasyon)
+      // UPDATE (barkod değişiyorsa set et)
       await client.query(
         `UPDATE ${table}
-           SET status_id=$1, warehouse_id=$2, location_id=$3, updated_at=NOW()
+           SET status_id=$1,
+               warehouse_id=$2,
+               location_id=$3,
+               ${changingBarcode ? "barcode=$5," : ""} 
+               updated_at=NOW()
          WHERE id=$4`,
-        [toStatus, wh, lc, id]
+        changingBarcode ? [toStatus, wh, lc, id, nextBarcode] : [toStatus, wh, lc, id]
       );
 
       // TRANSITIONS
       if (willMove) {
-        // Önce MOVE (statü aynı kalır — sadece yer değişimi)
+        transitions.push({
+          item_type: it.kind === "component" ? ITEM_TYPE.COMPONENT : ITEM_TYPE.PRODUCT,
+          item_id: id,
+          action: ACTION.MOVE,            // ✅ MOVE
+          qty_delta: 0,
+          unit,
+          from_warehouse_id: prevWh || null,
+          from_location_id:  prevLc || null,
+          to_warehouse_id:   wh,
+          to_location_id:    lc,
+        });
+      }
+
+      // Statü değişimi
+      if (prevStatus !== toStatus) {
         transitions.push({
           item_type: it.kind === "component" ? ITEM_TYPE.COMPONENT : ITEM_TYPE.PRODUCT,
           item_id: id,
@@ -187,22 +238,20 @@ exports.approveItems = async (scope = "stock", items = []) => {
           unit,
           from_status_id: prevStatus,
           to_status_id: toStatus,
-          to_warehouse_id: wh,   // <<< eklendi
-          to_location_id: lc,    // <<< eklendi
         });
       }
 
-      // Sonra APPROVE (yalnız statü değişimi; depo/lokasyon alanı eklemiyoruz)
-      transitions.push({
-        item_type: it.kind === "component" ? ITEM_TYPE.COMPONENT : ITEM_TYPE.PRODUCT,
-        item_id: id,
-        action: ACTION.APPROVE,
-        qty_delta: 0,
-        unit,
-        from_status_id: prevStatus,
-        to_status_id: toStatus,
-        // NOT: approve kaydında depo/lokasyon set etmiyoruz
-      });
+      // Barkod attribute change log'u isterseniz (opsiyonel)
+      if (changingBarcode) {
+        transitions.push({
+          item_type: it.kind === "component" ? ITEM_TYPE.COMPONENT : ITEM_TYPE.PRODUCT,
+          item_id: id,
+          action: ACTION.ATTRIBUTE_CHANGE,
+          qty_delta: 0,
+          unit,
+          meta: { field: "barcode", before: current || null, after: nextBarcode },
+        });
+      }
     }
 
     if (transitions.length) {
