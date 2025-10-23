@@ -23,4 +23,5 @@ router.get("/approvals/pending", approvals.listPending);
 router.post("/approvals/approve", approvals.approveItems);     // stok onayı (pending -> in_stock)
 router.post("/approvals/complete", approvals.completeWork);    // üretim/serigrafi tamamlama
 
+
 module.exports = router;

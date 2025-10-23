@@ -1,10 +1,8 @@
-// src/services/componentsService.js
 const pool = require("../config/db");
 const { recordTransitions, makeBatchId } = require("./inventoryTransitionsService");
 const { ITEM_TYPE, ACTION } = require("../constants/transitions");
-// 🔗 Barkod merkezi servis
-const { assertFormatAndKind, assertAndConsume } = require("./barcodeService");
 
+// Status id sözlüğü (referans)
 const STATUS = {
   in_stock: 1,
   used: 2,
@@ -15,13 +13,13 @@ const STATUS = {
   screenprint: 7,
 };
 
-// helper: boşsa null, doluysa UPPER
-const normalizeBarcode = (b) => {
-  const s = String(b ?? "").trim();
-  return s ? s.toUpperCase() : null;
-};
-
-/* ======================== LIST ======================== */
+/**
+ * GENEL LİSTE
+ * - Hem listeler hem picker tarafından kullanılır.
+ * - availableOnly=true ise sadece in_stock (1) döner (picker için).
+ * Filters: search, warehouseId, locationId, masterId
+ * Shape: FE’nin beklediği geniş alan seti (status, warehouse/location/master, timestamps…)
+ */
 exports.list = async ({
   search = "",
   warehouseId = 0,
@@ -36,8 +34,7 @@ exports.list = async ({
       se.unit,
       se.quantity,
       se.width,
-      se.height,
-      se.invoice_no,
+      se.height, 
       se.created_at,
       se.created_by,
       se.approved_by,
@@ -73,14 +70,13 @@ exports.list = async ({
   if (search) {
     const term = `%${search}%`;
     params.push(term); const p1 = params.length; // barcode
-    params.push(term); const p2 = params.length; // master/tedarikçi/type/bimeks/invoice
+    params.push(term); const p2 = params.length; // master alanları
     where.push(`(
       se.barcode ILIKE $${p1}
       OR t.name ILIKE $${p2}
       OR s.name ILIKE $${p2}
       OR pm.bimeks_code ILIKE $${p2}
       OR pm.display_label ILIKE $${p2}
-      OR se.invoice_no ILIKE $${p2}
     )`);
   }
 
@@ -94,9 +90,8 @@ exports.list = async ({
     barcode: r.barcode,
     unit: r.unit,
     quantity: r.quantity,
-    width: r.width ?? null,
-    height: r.height ?? null,
-    invoice_no: r.invoice_no ?? null,
+    width: r.width ?? null,  
+    height: r.height ?? null,  
     created_at: r.created_at,
     warehouse: r.warehouse_id ? { id: r.warehouse_id, name: r.warehouse_name } : undefined,
     location:  r.location_id  ? { id: r.location_id,  name: r.location_name }  : undefined,
@@ -110,7 +105,9 @@ exports.list = async ({
   }));
 };
 
-/* ======================== GET BY ID ======================== */
+/**
+ * TEK KAYIT (Details sayfası)
+ */
 exports.getById = async (id) => {
   const sql = `
     SELECT
@@ -141,9 +138,8 @@ exports.getById = async (id) => {
     barcode: r.barcode,
     unit: r.unit,
     quantity: r.quantity,
-    width: r.width ?? null,
-    height: r.height ?? null,
-    invoice_no: r.invoice_no ?? null,
+    width: r.width ?? null,    
+    height: r.height ?? null,   
     created_at: r.created_at,
     updated_at: r.updated_at,
     approved_at: r.approved_at,
@@ -158,17 +154,19 @@ exports.getById = async (id) => {
   };
 };
 
-/* ======================== UPDATE ======================== */
 /**
- * payload: { barcode?, master_id?, quantity?, unit?, status_id?, warehouse_id?, location_id?, notes?, invoice_no? }
+ * GÜNCELLE (Details sayfası)
+ * payload: { barcode?, master_id?, quantity?, unit?, status_id?, warehouse_id?, location_id?, notes? }
+ * (Basit örnek; gerekli validasyonları genişletebiliriz.)
  */
 exports.update = async (id, payload = {}) => {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
 
+    // 0) Önce mevcut kaydı kilitle çek (FOR UPDATE) — diff için gerekli
     const { rows: beforeRows } = await client.query(
-      `SELECT id, barcode, master_id, quantity, unit, status_id, warehouse_id, location_id, notes, invoice_no
+      `SELECT id, barcode, master_id, quantity, unit, status_id, warehouse_id, location_id, notes
          FROM components WHERE id = $1 FOR UPDATE`,
       [id]
     );
@@ -177,59 +175,10 @@ exports.update = async (id, payload = {}) => {
       const e = new Error("NOT_FOUND"); e.status = 404; throw e;
     }
 
-    // ── in_stock'a geçişte barkod zorunlu
-    if (payload.status_id !== undefined && Number(payload.status_id) === STATUS.in_stock) {
-      const plannedBarcode = payload.barcode !== undefined
-        ? normalizeBarcode(payload.barcode)
-        : normalizeBarcode(before.barcode);
-
-      if (!plannedBarcode) {
-        const err = new Error("BARCODE_REQUIRED_FOR_IN_STOCK");
-        err.status = 400;
-        err.code = "BARCODE_REQUIRED_FOR_IN_STOCK";
-        err.message = "in_stock durumuna geçmek için barkod zorunludur.";
-        throw err;
-      }
-    }
-
-    // ── Barkod değişiyorsa: format + çakışma + havuzdan tüketme
-    if (
-      payload.barcode !== undefined &&
-      normalizeBarcode(payload.barcode) !== normalizeBarcode(before.barcode)
-    ) {
-      const nextBarcode = normalizeBarcode(payload.barcode); // null olabilir
-
-      if (nextBarcode) {
-        // 1) format/kind
-        assertFormatAndKind(nextBarcode, "component");
-
-        // 2) tabloda çakışma
-        const { rows: exists } = await client.query(
-          `SELECT 1 FROM components WHERE barcode=$1 AND id<>$2 LIMIT 1`,
-          [nextBarcode, id]
-        );
-        if (exists.length) {
-          const err = new Error("BARCODE_CONFLICT");
-          err.status = 409;
-          err.code = "BARCODE_CONFLICT";
-          throw err;
-        }
-
-        // 3) havuzdan tüket
-        await assertAndConsume(client, {
-          code: nextBarcode,
-          kind: "component",
-          refTable: "components",
-          refId: id,
-        });
-      }
-    }
-
-    // ── UPDATE
+    // 1) Normal UPDATE logic (senin mevcut kodun) — allowed set
     const allowed = [
       "barcode", "master_id", "quantity", "unit",
-      "status_id", "warehouse_id", "location_id",
-      "notes", "invoice_no"
+      "status_id", "warehouse_id", "location_id", "notes"
     ];
 
     const fields = [];
@@ -238,18 +187,12 @@ exports.update = async (id, payload = {}) => {
 
     for (const key of allowed) {
       if (payload[key] !== undefined) {
-        if (key === "barcode") {
-          fields.push(`barcode = $${idx++}`);
-          params.push(normalizeBarcode(payload.barcode)); // null atılabilir
-        } else {
-          fields.push(`${key} = $${idx++}`);
-          params.push(payload[key]);
-        }
+        fields.push(`${key} = $${idx++}`);
+        params.push(payload[key]);
       }
     }
-
     if (!fields.length) {
-      await client.query("ROLLBACK");
+      await client.query("ROLLBACK"); // değişiklik yoksa eski fonksiyon davranışı
       return await this.getById(id);
     }
 
@@ -258,15 +201,16 @@ exports.update = async (id, payload = {}) => {
       UPDATE components
          SET ${fields.join(", ")}, updated_at = NOW()
        WHERE id = $${idx}
-       RETURNING id, barcode, master_id, quantity, unit, status_id, warehouse_id, location_id, notes, invoice_no
+       RETURNING id, barcode, master_id, quantity, unit, status_id, warehouse_id, location_id, notes
     `;
     const { rows: afterRows } = await client.query(updSql, params);
     const after = afterRows[0];
 
-    // ── Transition kayıtları
+    // 2) Diffs → transition kayıtları
     const recs = [];
     const batchId = makeBatchId();
 
+    // a) STATUS_CHANGE
     if (payload.status_id !== undefined && Number(before.status_id) !== Number(after.status_id)) {
       recs.push({
         item_type: ITEM_TYPE.COMPONENT,
@@ -279,6 +223,7 @@ exports.update = async (id, payload = {}) => {
       });
     }
 
+    // b) MOVE (warehouse/location değişimi)
     const whChanged  = payload.warehouse_id !== undefined && Number(before.warehouse_id || 0) !== Number(after.warehouse_id || 0);
     const locChanged = payload.location_id  !== undefined && Number(before.location_id  || 0) !== Number(after.location_id  || 0);
     if (whChanged || locChanged) {
@@ -295,8 +240,10 @@ exports.update = async (id, payload = {}) => {
       });
     }
 
+    // c) ADJUST (miktar elle değiştiyse)
     if (payload.quantity !== undefined) {
       const beforeQ = Number(before.quantity || 0);
+      // EA için quantity kolonunu kullanmıyorsun; ama yine de diff 0 ise log atma
       const afterQ  = Number(after.quantity  || 0);
       const delta   = afterQ - beforeQ;
       if (delta !== 0) {
@@ -304,41 +251,44 @@ exports.update = async (id, payload = {}) => {
           item_type: ITEM_TYPE.COMPONENT,
           item_id: id,
           action: ACTION.ADJUST,
-          qty_delta: delta,
+          qty_delta: delta,               // + ya da -
           unit: after.unit || before.unit || "EA",
-          to_status_id: after.status_id,
+          to_status_id: after.status_id,  // mevcut son durum
         });
       }
     }
 
-    // opsiyonel: invoice_no değiştiyse kayıt altına al
-    if (payload.invoice_no !== undefined && String(before.invoice_no || "") !== String(after.invoice_no || "")) {
+    // d) ATTRIBUTE_CHANGE (barcode gibi kimlik alanları)
+    if (payload.barcode !== undefined && String(before.barcode || "") !== String(after.barcode || "")) {
       recs.push({
         item_type: ITEM_TYPE.COMPONENT,
         item_id: id,
         action: ACTION.ATTRIBUTE_CHANGE,
         qty_delta: 0,
         unit: after.unit || before.unit || "EA",
-        meta: { field: "invoice_no", before: before.invoice_no || null, after: after.invoice_no || null }
-      });
-    }
-
-    if (payload.barcode !== undefined && normalizeBarcode(before.barcode) !== normalizeBarcode(after.barcode)) {
-      recs.push({
-        item_type: ITEM_TYPE.COMPONENT,
-        item_id: id,
-        action: ACTION.ATTRIBUTE_CHANGE,
-        qty_delta: 0,
-        unit: after.unit || before.unit || "EA",
+        notes: null,
         meta: { field: "barcode", before: before.barcode || null, after: after.barcode || null }
       });
     }
+
+    // (notes değişimini timeline’a almak istemezsek yorumla)
+    // if (payload.notes !== undefined && String(before.notes || "") !== String(after.notes || "")) {
+    //   recs.push({
+    //     item_type: ITEM_TYPE.COMPONENT,
+    //     item_id: id,
+    //     action: ACTION.ATTRIBUTE_CHANGE,
+    //     qty_delta: 0,
+    //     unit: after.unit || before.unit || "EA",
+    //     meta: { field: "notes", before: before.notes || null, after: after.notes || null }
+    //   });
+    // }
 
     if (recs.length) {
       await recordTransitions(client, batchId, recs);
     }
 
     await client.query("COMMIT");
+    // Detay sayfasının beklediği response:
     return await this.getById(id);
   } catch (err) {
     await client.query("ROLLBACK");
@@ -348,27 +298,18 @@ exports.update = async (id, payload = {}) => {
   }
 };
 
-/* ======================== BULK CREATE ======================== */
+
 /**
- * entries: [{ master_id, unit, quantity, warehouse_id, location_id, width?, height?, invoice_no?, barcode? }]
- * - Tüm satırlar status_id=4 (pending) başlatılır.
- * - Barkod opsiyoneldir; verilirse format+çakışma kontrolü yapılır ve havuzdan tüketilir.
+ * BULK CREATE (stok girişi) — her zaman status_id=4 (pending)
+ * entries: [{ master_id, barcode, unit, quantity, warehouse_id, location_id }]
  */
 exports.bulkCreate = async (entries) => {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
 
-    // 0) format kontrolü (yalnızca barkodu olanlar için)
-    for (const e of entries) {
-      const b = normalizeBarcode(e.barcode);
-      if (b) assertFormatAndKind(b, "component");
-    }
-
-    // 1) çakışma kontrolü (yalnızca boş olmayan barkodlar)
-    const incoming = entries
-      .map(e => normalizeBarcode(e.barcode))
-      .filter(Boolean);
+    // 1) Barkod çakışması
+    const incoming = entries.map(e => String(e.barcode));
     if (incoming.length) {
       const { rows: existing } = await client.query(
         "SELECT barcode FROM components WHERE barcode = ANY($1)",
@@ -383,11 +324,10 @@ exports.bulkCreate = async (entries) => {
       }
     }
 
-    // 2) Insert
+    // 2) Dinamik insert
     const cols = [
       "master_id","barcode","unit","quantity",
-      "status_id","warehouse_id","location_id",
-      "width","height","invoice_no",
+      "status_id","warehouse_id","location_id", "width","height",
     ];
     const placeholders = [];
     const params = [];
@@ -395,19 +335,18 @@ exports.bulkCreate = async (entries) => {
     entries.forEach((e, i) => {
       const base = i * cols.length;
       placeholders.push(
-        `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6}, $${base + 7}, $${base + 8}, $${base + 9}, $${base + 10})`
+        `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6}, $${base + 7}, $${base + 8}, $${base + 9})`
       );
       params.push(
-        Number(e.master_id),
-        normalizeBarcode(e.barcode),             // null olabilir
+        e.master_id,
+        e.barcode,
         e.unit,
-        e.unit === "EA" ? 1 : Number(e.quantity || 0),
-        STATUS.pending,                          // 4
-        Number(e.warehouse_id),
-        Number(e.location_id),
-        e.width ?? null,
-        e.height ?? null,
-        e.invoice_no ?? null
+        e.quantity,
+        STATUS.pending,        // 4
+        e.warehouse_id,
+        e.location_id,
+        e.width ?? null,    // ✨ yeni
+        e.height ?? null
       );
     });
 
@@ -418,19 +357,7 @@ exports.bulkCreate = async (entries) => {
     `;
     const { rows } = await client.query(sql, params);
 
-    // 3) Barkod havuzundan tüket (yalnızca barkodu olanlar)
-    for (const r of rows) {
-      const b = normalizeBarcode(r.barcode);
-      if (!b) continue;
-      await assertAndConsume(client, {
-        code: b,
-        kind: "component",
-        refTable: "components",
-        refId: r.id,
-      });
-    }
-
-    // 4) Transition kayıtları
+    /* NEW: CREATE transitions */
     const batchId = makeBatchId();
     const createRecords = rows.map(r => ({
       item_type: ITEM_TYPE.COMPONENT,
