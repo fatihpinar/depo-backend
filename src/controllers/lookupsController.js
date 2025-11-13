@@ -1,6 +1,6 @@
 // src/controllers/lookupsController.js
-const pool = require("../config/db");
-const { getSchema } = require("../constants/masterFieldSchema");
+const pool = require("../core/db/index");
+const { getSchema } = require("../modules/masters/masters.schema");
 
 /* -------------------- CATEGORIES -------------------- */
 exports.getCategories = async (req, res) => {

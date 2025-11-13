@@ -1,5 +1,5 @@
 // src/services/inventoryService.js
-const pool = require('../config/db');
+const pool = require('../core/db/index');
 
 // src/services/inventoryService.js
 exports.list = async ({

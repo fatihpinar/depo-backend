@@ -1,26 +1,26 @@
-// src/routes/index.js
 const express = require("express");
 const router = express.Router();
 
-const approvals = require("../controllers/approvalsController");
+const { middleware } = require("../modules/auth");
 
-/* Lookups */
+// Public
+router.use("/auth", require("../modules/auth").router);
+
+// ↓↓↓ Buradan sonrası korunur
+router.use(middleware.requireAuth);
+
 router.use("/lookups", require("./lookups"));
-/* Masters */
-router.use("/masters", require("./masters"));
-/* Canonical resources */
-router.use("/components", require("./components"));
-router.use("/products", require("./products"));
-/* Envanter (✅ geri ekle) */
+router.use("/masters", require("../modules/masters/masters.routes"));
+router.use("/components", require("../modules/components/components.routes"));
+router.use("/products/recipes", require("../modules/products/recipes/recipes.routes"));
+router.use("/products", require("../modules/products/products.routes"));
 router.use("/inventory", require("./inventory"));
-/* Timeline */
-router.use("/inventory-transitions", require("./transitions"));
-/* Recipes */
-router.use("/recipes", require("./recipes"));
+router.use("/inventory-transitions", require("../modules/transitions").router);
+router.use("/approvals", require("../modules/approvals/approvals.routes"));
 
-/* Approvals */
-router.get("/approvals/pending", approvals.listPending);
-router.post("/approvals/approve", approvals.approveItems);     // stok onayı (pending -> in_stock)
-router.post("/approvals/complete", approvals.completeWork);    // üretim/serigrafi tamamlama
+// legacy
+router.post("/product-assemblies", (req,res,next)=> {
+  require("../modules/products/products.controller").assemble(req,res,next);
+});
 
 module.exports = router;
