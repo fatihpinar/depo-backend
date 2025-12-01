@@ -16,7 +16,4 @@ jobs:
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_KEY }}
           script: |
-            cd /srv/depo-backend
-            git pull origin main          # branch adına göre güncelle
-            npm install --production
-            pm2 reload depo-backend || pm2 start ecosystem.config.js
+            /usr/local/bin/deploy-depo-backend.sh
