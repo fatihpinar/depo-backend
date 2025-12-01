@@ -1,0 +1,22 @@
+name: Deploy Backend to EC2
+
+on:
+  push:
+    branches: [ main ]   # ana branch'in "master" ise burayı master yap
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy to EC2 via SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          script: |
+            cd /srv/depo-backend
+            git pull origin main        # branch ismine göre güncelle
+            npm install --production
+            pm2 reload depo-backend || pm2 start ecosystem.config.js
