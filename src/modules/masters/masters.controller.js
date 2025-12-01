@@ -1,19 +1,24 @@
 // src/modules/masters/masters.controller.js
 const service = require("./masters.service");
 
+// GET /components
 exports.list = async (req, res) => {
   try {
-    const categoryId = parseInt(req.query.categoryId || 0, 10);
-    const typeId     = parseInt(req.query.typeId || 0, 10);
-    const search     = (req.query.search || "").trim();
+    const productTypeId = Number(req.query.productTypeId || 0);
+    const carrierTypeId = Number(req.query.carrierTypeId || 0);
+    const search        = (req.query.search || "").trim();
 
-    const rows = await service.list({ categoryId, typeId, search });
+    const rows = await service.list({ productTypeId, carrierTypeId, search });
     res.json(rows);
   } catch (err) {
-    console.error("Master listesi hatası:", err);
-    res.status(500).json({ error: "Master kayıtları alınamadı" });
+    console.error("masters list error MESSAGE:", err.message);
+    console.error("masters list error DETAIL:", err);
+    return res
+      .status(500)
+      .json({ message: err.message || "Internal error" });
   }
 };
+
 
 exports.create = async (req, res) => {
   try {

@@ -69,7 +69,7 @@ exports.update = async (id, payload = {}, actorId = null) => {
     });
 
     // 3) Alan güncelle
-    const allowed = ["barcode","bimeks_code","master_id","status_id","warehouse_id","location_id","notes"];
+    const allowed = ["barcode","bimeks_code","product_name","status_id","warehouse_id","location_id","notes"];
     const fields = {};
     for (const k of allowed) if (payload[k] !== undefined) fields[k] = payload[k];
     if (payload.barcode !== undefined) fields.barcode = nextBarcode;
@@ -165,77 +165,130 @@ exports.assemble = async (payload, actorId = null) => {
   if (!payload || !payload.product || !Array.isArray(payload.components) || !payload.components.length) {
     const e = new Error("INVALID_PAYLOAD"); e.status = 400; e.code = "INVALID_PAYLOAD"; throw e;
   }
-  const { product, components } = payload;
+    const { product, components } = payload;
 
-  if (!product.master_id || !product.target) {
-    const e = new Error("MISSING_PRODUCT_FIELDS"); e.status = 400; e.code = "MISSING_PRODUCT_FIELDS"; throw e;
+  const target      = String(product.target || "").trim();
+  const productName = String(product.product_name || "").trim();
+  const recipeId    = product.recipe_id ? String(product.recipe_id) : null;
+
+  // Artık sadece ürün adı ve hedef zorunlu
+  if (!productName || !target) {
+    const e = new Error("MISSING_PRODUCT_FIELDS");
+    e.status = 400;
+    e.code   = "MISSING_PRODUCT_FIELDS";
+    throw e;
   }
-  const target = String(product.target);
-  if (!["stock","production","screenprint"].includes(target)) {
+
+
+    if (!["stock","production","screenprint"].includes(target)) {
     const e = new Error("INVALID_TARGET"); e.status = 400; e.code = "INVALID_TARGET"; throw e;
   }
   if (target === "stock" && (!product.warehouse_id || !product.location_id)) {
     const e = new Error("WAREHOUSE_LOCATION_REQUIRED"); e.status = 400; e.code = "WAREHOUSE_LOCATION_REQUIRED"; throw e;
   }
 
-  const client = await pool.connect();
+
+    const client = await pool.connect();
   try {
     await client.query("BEGIN");
 
     const status_id = ASSEMBLE_STATUS[target];
     const productId = await repo.insertProduct(client, {
-      master_id: product.master_id,
       barcode: null,
       bimeks_code: (product.bimeks_code || "").trim() || null,
       status_id,
       warehouse_id: target === "stock" ? product.warehouse_id || null : null,
       location_id:  target === "stock" ? product.location_id  || null : null,
-      created_by: actorId || null,                 // 👈
+      product_name: productName,
+      recipe_id:    recipeId,
+      created_by:   actorId || null,
     });
 
     const consumeTransitions = [];
 
+    // src/modules/products/products.service.js → assemble() içinde for döngüsü
+
+    // products.service.js → assemble() içinde
+
     for (const item of components) {
-      const compId = Number(item.component_id);
-      if (!compId) throw new Error("INVALID_COMPONENT_ID");
-      const requested = Number(item.consume_qty || 0);
-
-      const comp = await repo.lockComponentById(client, compId);
-      if (!comp) { const e = new Error("COMPONENT_NOT_FOUND"); e.status = 404; throw e; }
-
-      if (comp.unit === "EA") {
-        await repo.updateComponentFields(client, comp.id, { status_id: STATUS_IDS.used });
-        await repo.insertProductComponentLink(client, { product_id: productId, component_id: comp.id, consume_qty: 1 });
-
-        consumeTransitions.push({
-          item_type: ITEM_TYPE.COMPONENT, item_id: comp.id, action: ACTION.CONSUME,
-          qty_delta: -1, unit: comp.unit,
-          from_warehouse_id: comp.warehouse_id || null, from_location_id: comp.location_id || null,
-          to_status_id: STATUS_IDS.used, context_type: "product", context_id: productId,
-        });
-      } else {
-        if (requested <= 0) { const e = new Error("INVALID_CONSUME_QTY"); e.status = 400; throw e; }
-        const have = Number(comp.quantity || 0);
-        if (requested > have) { const e = new Error("CONSUME_GT_STOCK"); e.status = 409; throw e; }
-
-        const left = have - requested;
-        if (left === 0) {
-          await repo.updateComponentFields(client, comp.id, { quantity: 0, status_id: STATUS_IDS.used });
-        } else {
-          await repo.updateComponentFields(client, comp.id, { quantity: left });
-        }
-
-        await repo.insertProductComponentLink(client, { product_id: productId, component_id: comp.id, consume_qty: requested });
-
-        consumeTransitions.push({
-          item_type: ITEM_TYPE.COMPONENT, item_id: comp.id, action: ACTION.CONSUME,
-          qty_delta: -requested, unit: comp.unit,
-          from_warehouse_id: comp.warehouse_id || null, from_location_id: comp.location_id || null,
-          to_status_id: left === 0 ? STATUS_IDS.used : STATUS_IDS.in_stock,
-          context_type: "product", context_id: productId,
-        });
-      }
+    const compId = Number(item.component_id || 0);
+    if (!compId) {
+      const e = new Error("INVALID_COMPONENT_ID");
+      e.status = 400;
+      e.code   = "INVALID_COMPONENT_ID";
+      throw e;
     }
+
+    // FE HER ZAMAN ALAN GÖNDERİYOR (um²/m²)
+    const requested = Number(item.consume_qty || 0);
+    if (!Number.isFinite(requested) || requested <= 0) {
+      const e = new Error("INVALID_CONSUME_QTY");
+      e.status = 400;
+      e.code   = "INVALID_CONSUME_QTY";
+      throw e;
+    }
+
+    const comp = await repo.lockComponentById(client, compId);
+    if (!comp) {
+      const e = new Error("COMPONENT_NOT_FOUND");
+      e.status = 404;
+      e.code   = "COMPONENT_NOT_FOUND";
+      throw e;
+    }
+
+    // 🔴 KRİTİK: STOK HER ZAMAN ALAN → area
+    const currentArea = Number(comp.area || 0);
+    if (!Number.isFinite(currentArea) || currentArea <= 0) {
+      const e = new Error("NO_STOCK");
+      e.status = 409;
+      e.code   = "NO_STOCK";
+      throw e;
+    }
+
+    if (requested > currentArea) {
+      const e = new Error("CONSUME_GT_STOCK");
+      e.status = 409;
+      e.code   = "CONSUME_GT_STOCK";
+      throw e;
+    }
+
+    const leftArea = currentArea - requested;
+
+    // 🟢 ORİJİNAL COMPONENT’İN STOK ALANI DÜŞÜYOR
+    const updateFields = {
+      area: leftArea,
+      quantity: leftArea,             // istersen bırak, istersen hiç set etme
+    };
+    if (leftArea === 0) {
+      updateFields.status_id = STATUS_IDS.used;
+    }
+
+    await repo.updateComponentFields(client, comp.id, updateFields);
+
+    // 🟢 PRODUCT_COMPONENTS: CONSUME_QTY = KULLANILAN ALAN
+    await repo.insertProductComponentLink(client, {
+      product_id: productId,
+      component_id: comp.id,
+      consume_qty: requested,
+    });
+
+    // 🟢 TRANSITION: alan kadar tüketim
+    consumeTransitions.push({
+      item_type: ITEM_TYPE.COMPONENT,
+      item_id: comp.id,
+      action: ACTION.CONSUME,
+      qty_delta: -requested,
+      unit: comp.unit || "EA", // burada sadece label; um²/m² vs düşün
+      from_warehouse_id: comp.warehouse_id || null,
+      from_location_id: comp.location_id || null,
+      to_status_id: leftArea === 0 ? STATUS_IDS.used : STATUS_IDS.in_stock,
+      context_type: "product",
+      context_id: productId,
+    });
+  }
+
+
+
 
     const batchId = makeBatchId();
     await recordTransitions(client, batchId, [{

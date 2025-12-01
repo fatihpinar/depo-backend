@@ -1,157 +1,195 @@
 // src/modules/masters/masters.service.js
+const pool = require("../../core/db/index");
 const repo = require("./masters.repository");
-const { buildDisplayLabel } = require("./masters.display");
-const { getFieldsForCategory, getBaseFields } = require("./masters.schema");
 
 
-/* ---------------- Helpers ---------------- */
-const toNull = (v) =>
-  v === undefined || v === null || (typeof v === "string" && v.trim() === "") ? null : v;
-
-const isEmpty = (v) =>
-  v === undefined || v === null || (typeof v === "string" && v.trim() === "");
-
-/** şema: izinli + zorunlu alanlar */
-function deriveSchemaFor(categoryId) {
-  const base = getBaseFields();
-  const cat  = getFieldsForCategory(categoryId);
-
-  const allowedNames = new Set([
-    ...base.map((f) => f.name),
-    ...cat.fields.map((f) => f.name),
-    "category_id", "type_id", "supplier_id",
-  ]);
-
-  const requiredNames = [
-    ...base.filter((f) => f.required).map((f) => f.name),
-    ...cat.fields.filter((f) => f.required).map((f) => f.name),
-  ];
-
-  return { allowedNames, requiredNames };
-}
-
-/** display label üretimi için tip/supplier adları resolve */
-async function resolveNames({ type_id, supplier_id }) {
-  return await repo.resolveNames(type_id, supplier_id);
-}
-
-/* ---------------- List ---------------- */
-exports.list = async ({ categoryId = 0, typeId = 0, search = "" } = {}) => {
-  return await repo.findMany({ categoryId, typeId, search });
+// ---- LIST / DETAIL ----
+exports.list = async ({ productTypeId = 0, carrierTypeId = 0, search = "" } = {}) => {
+  return repo.findMany({ productTypeId, carrierTypeId, search });
 };
 
-/* ---------------- GetById ---------------- */
 exports.getById = async (id) => {
-  return await repo.findJoinedById(id);
+  return repo.findJoinedById(id);
 };
 
-/* ---------------- Create ---------------- */
+
+// NULL ise "00", varsa display_code dönen yardımcı
+async function getDisplayCode(client, table, id, pad = 0, defaultCode = "00") {
+  if (!id) return defaultCode;
+  const { rows } = await client.query(
+    `SELECT display_code FROM ${table} WHERE id = $1`,
+    [id]
+  );
+  if (!rows[0] || !rows[0].display_code) return defaultCode;
+
+  let code = String(rows[0].display_code).trim();
+  if (pad > 0) code = code.padStart(pad, "0");
+  return code;
+}
+
+// Sayısal alanları (kalınlık / yoğunluk) kodlamak için
+function numericToCode(value, totalDigits) {
+  if (value === null || value === undefined || value === "") {
+    return "".padStart(totalDigits, "0");
+  }
+  const s = String(value).replace(",", "."); // TR decimal -> .
+  const normalized = s.replace(".", "");
+  return normalized.padStart(totalDigits, "0");
+}
+
+
+/* ========== CREATE (YENİ MİMARİ) ========== */
+
 exports.create = async (payload = {}) => {
-  const category_id = Number(payload.category_id);
-  const type_id     = Number(payload.type_id);
-  if (!category_id || !type_id) {
-    const e = new Error("category_id ve type_id zorunludur");
-    e.status = 400; throw e;
+  const {
+    product_type_id,
+    supplier_id,
+    carrier_type_id,
+    carrier_color_id,
+    liner_color_id,
+    liner_type_id,
+    adhesive_type_id,
+    thickness,           // numeric
+    carrier_density,     // numeric
+    supplier_product_code,
+    bimeks_product_name,
+    length_unit,         // 👈 stok uzunluk birimi: "m" | "um"
+  } = payload || {};
+
+  // ---- Zorunlu alan kontrolleri ----
+  if (!product_type_id) {
+    const e = new Error("PRODUCT_TYPE_REQUIRED");
+    e.status = 400;
+    e.message = "Ürün türü zorunludur.";
+    throw e;
+  }
+  if (!supplier_id) {
+    const e = new Error("SUPPLIER_REQUIRED");
+    e.status = 400;
+    e.message = "Tedarikçi zorunludur.";
+    throw e;
+  }
+  if (!bimeks_product_name || !String(bimeks_product_name).trim()) {
+    const e = new Error("BIMEKS_PRODUCT_NAME_REQUIRED");
+    e.status = 400;
+    e.message = "Bimeks ürün tanımı zorunludur.";
+    throw e;
+  }
+  if (!supplier_product_code || !String(supplier_product_code).trim()) {
+    const e = new Error("SUPPLIER_PRODUCT_CODE_REQUIRED");
+    e.status = 400;
+    e.message = "Tedarikçi ürün kodu zorunludur.";
+    throw e;
   }
 
-  const { allowedNames, requiredNames } = deriveSchemaFor(category_id);
-
-  const clean = {};
-  Object.keys(payload || {}).forEach((k) => {
-    if (allowedNames.has(k)) clean[k] = payload[k];
-  });
-
-  const missing = requiredNames.filter((n) => isEmpty(clean[n]));
-  if (missing.length) {
-    const e = new Error(`Eksik zorunlu alan(lar): ${missing.join(", ")}`);
-    e.status = 400; e.code = "required_fields_missing"; throw e;
+  // ---- Stok uzunluk birimi ("m" veya "um") ----
+  let finalLengthUnit = (length_unit || "").toLowerCase();
+  if (finalLengthUnit !== "m" && finalLengthUnit !== "um") {
+    finalLengthUnit = "m"; // varsayılan: metre
   }
 
-  [
-    "supplier_id",
-    "supplier_product_code",
-    "color_pattern",
-    "thickness",
-    "width",
-    "density",
-    "weight",
-    "liner_thickness",
-    "liner_color",
-    "adhesive_grammage_gm2",
-    "supplier_lot_no",
-  ].forEach((k) => { if (k in clean) clean[k] = toNull(clean[k]); });
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
 
-  clean.unit_kind    = clean.unit_kind    || "count";
-  clean.default_unit = clean.default_unit || "EA";
+    // 1) Display code'ları çek (name değil display_code kullanıyoruz)
+    const supplierCode     = await getDisplayCode(client, "suppliers",      supplier_id,      0, "00");
+    const productTypeCode  = await getDisplayCode(client, "product_types",  product_type_id,  0, "0");
+    const carrierTypeCode  = await getDisplayCode(client, "carrier_types",  carrier_type_id,  0, "0");
+    const carrierColorCode = await getDisplayCode(client, "carrier_colors", carrier_color_id, 0, "00");
+    const linerColorCode   = await getDisplayCode(client, "liner_colors",   liner_color_id,   0, "00");
+    const linerTypeCode    = await getDisplayCode(client, "liner_types",    liner_type_id,    0, "00");
+    const adhesiveTypeCode = await getDisplayCode(client, "adhesive_types", adhesive_type_id, 0, "0");
 
-  const { type_name, supplier_name } = await resolveNames({
-    type_id: clean.type_id || type_id,
-    supplier_id: clean.supplier_id,
-  });
+    // 2) Kalınlık ve yoğunluk kodları
+    const thicknessCode = numericToCode(thickness, 4);      // örn: 50  -> "050"
+    const densityCode   = numericToCode(carrier_density, 3);// örn: 120 -> "120"
 
-  const display_label = buildDisplayLabel({
-    category_id,
-    supplier_product_code: clean.supplier_product_code,
-    color_pattern:         clean.color_pattern,
-    thickness:             clean.thickness,
-    width:                 clean.width,
-    density:               clean.density,
-    weight:                clean.weight,
-    liner_thickness:       clean.liner_thickness,
-    liner_color:           clean.liner_color,
-    adhesive_grammage_gm2: clean.adhesive_grammage_gm2,
-    supplier_lot_no:       clean.supplier_lot_no,
-    type_name,
-    supplier_name,
-  });
+    // 3) Bimeks kodu: tedarikçi & product_type & carrier_type & carrier_color &
+    //    kalınlık & taşıyıcı yoğunluk & liner_color & liner_type & adhesive_type
+    const bimeks_code = [
+      supplierCode,
+      productTypeCode,
+      carrierTypeCode,
+      thicknessCode,
+      carrierColorCode,
+      densityCode,
+      linerColorCode,
+      linerTypeCode,
+      adhesiveTypeCode,
+    ].join("");
 
-  return await repo.insertOne({ ...clean, category_id, type_id, display_label });
+    // 4) DB insert
+    const insertSql = `
+      INSERT INTO masters (
+        product_type_id,
+        carrier_type_id,
+        supplier_id,
+        supplier_product_code,
+        thickness,
+        carrier_density,
+        carrier_color_id,
+        liner_color_id,
+        liner_type_id,
+        adhesive_type_id,
+        bimeks_code,
+        bimeks_product_name,
+        length_unit            -- 👈 YENİ
+      )
+      VALUES (
+        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13
+      )
+      RETURNING
+        id,
+        product_type_id,
+        carrier_type_id,
+        supplier_id,
+        supplier_product_code,
+        thickness,
+        carrier_density,
+        carrier_color_id,
+        liner_color_id,
+        liner_type_id,
+        adhesive_type_id,
+        bimeks_code,
+        bimeks_product_name,
+        length_unit
+    `;
+
+    const { rows } = await client.query(insertSql, [
+      product_type_id,
+      carrier_type_id || null,
+      supplier_id,
+      supplier_product_code.trim(),
+      thickness !== undefined ? thickness : null,
+      carrier_density !== undefined ? carrier_density : null,
+      carrier_color_id || null,
+      liner_color_id || null,
+      liner_type_id || null,
+      adhesive_type_id || null,
+      bimeks_code,
+      bimeks_product_name.trim(),
+      finalLengthUnit,
+    ]);
+
+    await client.query("COMMIT");
+    return rows[0];
+  } catch (err) {
+    await client.query("ROLLBACK");
+
+    // bimeks_code unique ise buraya düşer
+    if (err.code === "23505") {
+      err.status = 409;
+      err.message = "Bu Bimeks kodu ile kayıt zaten mevcut.";
+    }
+    throw err;
+  } finally {
+    client.release();
+  }
 };
 
-/* ---------------- Update (full) ---------------- */
 exports.update = async (id, payload = {}) => {
-  const current = await repo.findJoinedById(id);
-  if (!current) { const e = new Error("NOT_FOUND"); e.status = 404; throw e; }
-
-  const effectiveCategoryId = payload.category_id ?? current.category_id;
-  const { allowedNames, requiredNames } = deriveSchemaFor(effectiveCategoryId);
-
-  const clean = {};
-  Object.keys(payload || {}).forEach((k) => {
-    if (allowedNames.has(k)) clean[k] = payload[k];
-  });
-
-  const merged = { ...current, ...clean };
-  const missing = requiredNames.filter((n) => isEmpty(merged[n]));
-  if (missing.length) {
-    const e = new Error(`Eksik zorunlu alan(lar): ${missing.join(", ")}`);
-    e.status = 400; e.code = "required_fields_missing"; throw e;
-  }
-
-  const finalTypeId     = merged.type_id;
-  const finalSupplierId = merged.supplier_id;
-
-  const { type_name, supplier_name } = await resolveNames({
-    type_id: finalTypeId,
-    supplier_id: finalSupplierId,
-  });
-
-  const display_label = buildDisplayLabel({
-    category_id: effectiveCategoryId,
-    supplier_product_code: merged.supplier_product_code,
-    color_pattern:         merged.color_pattern,
-    thickness:             merged.thickness,
-    width:                 merged.width,
-    density:               merged.density,
-    weight:                merged.weight,
-    liner_thickness:       merged.liner_thickness,
-    liner_color:           merged.liner_color,
-    adhesive_grammage_gm2: merged.adhesive_grammage_gm2,
-    supplier_lot_no:       merged.supplier_lot_no,
-    type_name,
-    supplier_name,
-  });
-
-  await repo.updateOne(id, { ...clean, display_label });
-  return await repo.findJoinedById(id);
+  await repo.updateOne(id, payload);
+  return repo.findJoinedById(id);
 };
+

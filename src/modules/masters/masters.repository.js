@@ -1,33 +1,34 @@
 // src/modules/masters/masters.repository.js
 const pool = require("../../core/db/index");
 
-/* ---- isim çözümleyici ---- */
-exports.resolveNames = async (type_id, supplier_id) => {
-  let type_name = null, supplier_name = null;
-  if (type_id) {
-    const { rows } = await pool.query("SELECT name FROM types WHERE id=$1", [type_id]);
-    type_name = rows[0]?.name || null;
-  }
-  if (supplier_id) {
-    const { rows } = await pool.query("SELECT name FROM suppliers WHERE id=$1", [supplier_id]);
-    supplier_name = rows[0]?.name || null;
-  }
-  return { type_name, supplier_name };
-};
-
 /* ---- tekil JOIN’li ---- */
 exports.findJoinedById = async (id) => {
   const sql = `
     SELECT
-      pm.*,
-      t.name AS type_name,
-      s.name AS supplier_name,
-      c.name AS category_name
-    FROM masters pm
-    JOIN types t           ON pm.type_id = t.id
-    LEFT JOIN suppliers s  ON pm.supplier_id = s.id
-    LEFT JOIN categories c ON pm.category_id = c.id
-    WHERE pm.id = $1
+      m.*,
+      pt.name         AS product_type_name,
+      pt.display_code AS product_type_code,
+      ct.name         AS carrier_type_name,
+      ct.display_code AS carrier_type_code,
+      s.name          AS supplier_name,
+      s.display_code  AS supplier_code,
+      cc.name         AS carrier_color_name,
+      cc.display_code AS carrier_color_code,
+      lc.name         AS liner_color_name,
+      lc.display_code AS liner_color_code,
+      lt.name         AS liner_type_name,
+      lt.display_code AS liner_type_code,
+      at.name         AS adhesive_type_name,
+      at.display_code AS adhesive_type_code
+    FROM masters m
+    JOIN product_types  pt ON pt.id = m.product_type_id
+    LEFT JOIN carrier_types   ct ON ct.id = m.carrier_type_id
+    LEFT JOIN suppliers       s  ON s.id  = m.supplier_id
+    LEFT JOIN carrier_colors  cc ON cc.id = m.carrier_color_id
+    LEFT JOIN liner_colors    lc ON lc.id = m.liner_color_id
+    LEFT JOIN liner_types     lt ON lt.id = m.liner_type_id
+    LEFT JOIN adhesive_types  at ON at.id = m.adhesive_type_id
+    WHERE m.id = $1
     LIMIT 1
   `;
   const { rows } = await pool.query(sql, [id]);
@@ -35,90 +36,92 @@ exports.findJoinedById = async (id) => {
 };
 
 /* ---- liste ---- */
-exports.findMany = async ({ categoryId = 0, typeId = 0, search = "" } = {}) => {
+exports.findMany = async ({ productTypeId = 0, carrierTypeId = 0, search = "" } = {}) => {
   let sql = `
     SELECT
-      pm.*,
-      t.name AS type_name,
-      s.name AS supplier_name,
-      c.name AS category_name
-    FROM masters pm
-    JOIN types t           ON pm.type_id = t.id
-    LEFT JOIN suppliers s  ON pm.supplier_id = s.id
-    LEFT JOIN categories c ON pm.category_id = c.id
+      m.*,
+      pt.name         AS product_type_name,
+      pt.display_code AS product_type_code,
+      ct.name         AS carrier_type_name,
+      ct.display_code AS carrier_type_code,
+      s.name          AS supplier_name,
+      s.display_code  AS supplier_code,
+      cc.name         AS carrier_color_name,
+      cc.display_code AS carrier_color_code,
+      lc.name         AS liner_color_name,
+      lc.display_code AS liner_color_code,
+      lt.name         AS liner_type_name,
+      lt.display_code AS liner_type_code,
+      at.name         AS adhesive_type_name,
+      at.display_code AS adhesive_type_code
+    FROM masters m  
+    JOIN product_types  pt ON pt.id = m.product_type_id
+    LEFT JOIN carrier_types   ct ON ct.id = m.carrier_type_id
+    LEFT JOIN suppliers       s  ON s.id  = m.supplier_id
+    LEFT JOIN carrier_colors  cc ON cc.id = m.carrier_color_id
+    LEFT JOIN liner_colors    lc ON lc.id = m.liner_color_id
+    LEFT JOIN liner_types     lt ON lt.id = m.liner_type_id
+    LEFT JOIN adhesive_types  at ON at.id = m.adhesive_type_id
   `;
+
   const where = [];
   const params = [];
 
-  if (categoryId > 0) { params.push(categoryId); where.push(`pm.category_id = $${params.length}`); }
-  if (typeId     > 0) { params.push(typeId);     where.push(`pm.type_id     = $${params.length}`); }
-  if (search) {
-    const term = `%${search}%`;
-    params.push(term); const p1 = params.length;
-    params.push(term); const p2 = params.length;
-    params.push(term); const p3 = params.length;
-    where.push(`(pm.display_label ILIKE $${p1} OR s.name ILIKE $${p2} OR t.name ILIKE $${p3})`);
+  // Ürün türü filtresi
+  if (productTypeId > 0) {
+    params.push(productTypeId);
+    where.push(`m.product_type_id = $${params.length}`);
   }
 
-  if (where.length) sql += ` WHERE ${where.join(" AND ")}`;
-  sql += ` ORDER BY pm.id DESC`;
+  // Taşıyıcı türü filtresi
+  if (carrierTypeId > 0) {
+    params.push(carrierTypeId);
+    where.push(`m.carrier_type_id = $${params.length}`);
+  }
+
+  // Serbest metin arama
+  if (search) {
+    params.push(`%${search}%`);
+    const p = params.length;
+
+    where.push(
+      `( m.bimeks_code ILIKE $${p}
+         OR m.bimeks_product_name ILIKE $${p}
+         OR s.name ILIKE $${p}
+         OR pt.name ILIKE $${p}
+         OR ct.name ILIKE $${p}
+         OR cc.name ILIKE $${p}
+         OR lc.name ILIKE $${p}
+         OR lt.name ILIKE $${p}
+         OR at.name ILIKE $${p}
+       )`
+    );
+  }
+
+  if (where.length) {
+    sql += ` WHERE ${where.join(" AND ")}`;
+  }
+
+  sql += " ORDER BY m.id DESC";
 
   const { rows } = await pool.query(sql, params);
   return rows;
 };
 
-/* ---- insert ---- */
-exports.insertOne = async (clean) => {
-  const cols = [
-    "category_id","type_id","supplier_id","supplier_product_code",
-    "color_pattern","thickness","width","density","weight",
-    "unit_kind","default_unit",
-    "liner_thickness","liner_color","adhesive_grammage_gm2","supplier_lot_no",
-    "display_label","created_at","updated_at",
-  ];
-
-  const vals = [
-    clean.category_id,
-    clean.type_id,
-    clean.supplier_id || null,
-    clean.supplier_product_code || null,
-    clean.color_pattern || null,
-    clean.thickness || null,
-    clean.width || null,
-    clean.density || null,
-    clean.weight || null,
-    clean.unit_kind,
-    clean.default_unit,
-    clean.liner_thickness || null,
-    clean.liner_color || null,
-    clean.adhesive_grammage_gm2 || null,
-    clean.supplier_lot_no || null,
-    clean.display_label,
-  ];
-
-  const placeholders = cols.map((_, i) => `$${i + 1}`).slice(0, cols.length - 2);
-
-  const sql = `
-    INSERT INTO masters (${cols.join(", ")})
-    VALUES (${placeholders.join(", ")}, NOW(), NOW())
-    RETURNING id
-  `;
-  const { rows } = await pool.query(sql, vals);
-  const insertedId = rows[0].id;
-  return await exports.findJoinedById(insertedId);
-};
-
-/* ---- update ---- */
+/* ---- update (generic) ---- */
 exports.updateOne = async (id, clean) => {
   const fields = [];
   const params = [];
   let i = 1;
+
   Object.keys(clean).forEach((k) => {
     fields.push(`${k} = $${i++}`);
     params.push(clean[k] === "" ? null : clean[k]);
   });
+
   fields.push(`updated_at = NOW()`);
   params.push(id);
+
   const sql = `UPDATE masters SET ${fields.join(", ")} WHERE id = $${i}`;
   await pool.query(sql, params);
 };

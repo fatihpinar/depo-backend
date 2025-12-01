@@ -36,13 +36,24 @@ const STATUS_LABEL_FALLBACK_TR = Object.freeze({
 });
 
 // ——— Yardımcılar ———
-function translateActionTR(action, toStatusId, toStatusLabel) {
+// ——— Yardımcılar ———
+function translateActionTR(action, toStatusId, toStatusLabel, meta) {
+  // 🔹 Özel kural: component çıkışı ekranında "Hedef: Satış" ise
+  // BE meta.target = "sale" gönderiyor. Bunu yakalayıp başlığı "Satış" yapıyoruz.
+  if (action === ACTION.CONSUME && meta && meta.target === "sale") {
+    return "Satış";
+  }
+
+  // 🔹 Önce statü label'ını kullan
   if (toStatusLabel) return String(toStatusLabel);
   if (toStatusId && STATUS_LABEL_FALLBACK_TR[toStatusId]) {
     return STATUS_LABEL_FALLBACK_TR[toStatusId];
   }
+
+  // 🔹 Aksi halde aksiyon sözlüğüne düş
   return ACTION_LABEL_TR[action] || String(action);
 }
+
 
 function qtyText(delta, unit) {
   if (typeof delta !== "number" || !unit) return null;
@@ -52,7 +63,12 @@ function qtyText(delta, unit) {
 }
 
 function formatTransitionTR(t) {
-  const title = translateActionTR(t.action, t.to_status_id, t.to_status_label);
+  const title = translateActionTR(
+    t.action,
+    t.to_status_id,
+    t.to_status_label,
+    t.meta          // 👈 meta.target burada geliyor
+  );
 
   const fromWh = t.from_warehouse_name || null;
   const fromLc = t.from_location_name || null;

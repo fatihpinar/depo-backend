@@ -22,10 +22,17 @@ exports.withTransaction = async (fn) => {
 /* -----------------------------------------------------
  * LIST (pending/prod/screenprint birleşik sorgu)
  * --------------------------------------------------- */
-exports.listPendingUnion = async (statusToList, { search = "", limit = 100, offset = 0 } = {}) => {
+exports.listPendingUnion = async (
+  statusToList,
+  { search = "", limit = 100, offset = 0 } = {}
+) => {
   const params = [];
-  const push = (v) => { params.push(v); return `$${params.length}`; };
+  const push = (v) => {
+    params.push(v);
+    return `$${params.length}`;
+  };
 
+  // ❗ master.display_label yerine bimeks_product_name / product_name kullanıyoruz
   const unionSql = `
   (
     SELECT
@@ -33,16 +40,20 @@ exports.listPendingUnion = async (statusToList, { search = "", limit = 100, offs
       c.id,
       c.barcode,
       m.id AS master_id,
-      COALESCE(m.display_label, CONCAT('#', m.id)) AS display_label,
-      c.unit,
-      CASE WHEN c.unit='EA' THEN 1 ELSE c.quantity END AS quantity,
+      COALESCE(m.bimeks_product_name, CONCAT('#', m.id)) AS display_label,
+
+      -- 🔧 components tablosunda unit/quantity yok artık:
+      'EA'::text AS unit,
+      1         AS quantity,
+
       c.width,
       c.height,
+      c.area,
       c.warehouse_id,
       c.location_id,
       c.updated_at
     FROM components c
-    JOIN masters m ON m.id=c.master_id
+    JOIN masters m ON m.id = c.master_id
     WHERE c.status_id = ${statusToList}
   )
   UNION ALL
@@ -51,24 +62,30 @@ exports.listPendingUnion = async (statusToList, { search = "", limit = 100, offs
       'product' AS kind,
       p.id,
       p.barcode,
-      m.id AS master_id,
-      COALESCE(m.display_label, CONCAT('#', m.id)) AS display_label,
-      m.default_unit AS unit,
-      1 AS quantity,
+      NULL::int AS master_id,
+      COALESCE(p.product_name, p.bimeks_code, CONCAT('#', p.id)) AS display_label,
+
+      -- ürünler için de şimdilik 1 EA varsayıyoruz:
+      'EA'::text AS unit,
+      1         AS quantity,
+
       NULL::numeric AS width,
       NULL::numeric AS height,
+      NULL::numeric AS area,
       p.warehouse_id,
       p.location_id,
       p.updated_at
     FROM products p
-    JOIN masters m ON m.id = p.master_id
     WHERE p.status_id = ${statusToList}
-  )`;
+  )
+`;
 
   let where = "WHERE 1=1";
   if (search) {
     const term = `%${search}%`;
-    where += ` AND (t.barcode ILIKE ${push(term)} OR t.display_label ILIKE ${push(term)})`;
+    where += ` AND (t.barcode ILIKE ${push(term)} OR t.display_label ILIKE ${push(
+      term
+    )})`;
   }
 
   const sql = `
@@ -87,9 +104,13 @@ exports.listPendingUnion = async (statusToList, { search = "", limit = 100, offs
  * --------------------------------------------------- */
 exports.lockItem = async (client, table, id) => {
   const { rows } = await client.query(
-    `SELECT id, barcode, status_id, warehouse_id, location_id, ${
-      table === "components" ? "unit" : "NULL::text AS unit"
-    }
+    `SELECT
+       id,
+       barcode,
+       status_id,
+       warehouse_id,
+       location_id,
+       'EA'::text AS unit   -- 🔧 components'ta kolon yok, products için de EA varsayıyoruz
      FROM ${table}
      WHERE id=$1
      FOR UPDATE`,
@@ -97,6 +118,7 @@ exports.lockItem = async (client, table, id) => {
   );
   return rows[0] || null;
 };
+
 
 exports.getWarehouseDepartment = async (client, whId) => {
   const { rows } = await client.query(
@@ -114,24 +136,33 @@ exports.hasBarcodeConflict = async (client, table, barcode, id) => {
   return !!rows.length;
 };
 
-exports.updateApproval = async (client, table, {
-  toStatus, wh, lc, id, nextBarcode, changingBarcode,
-  setApproved = false, actorId = null,            // 👈 yeni paramlar
-}) => {
+exports.updateApproval = async (
+  client,
+  table,
+  {
+    toStatus,
+    wh,
+    lc,
+    id,
+    nextBarcode,
+    changingBarcode,
+    setApproved = false,
+    actorId = null,
+  }
+) => {
   const sets = [
     `status_id=$1`,
     `warehouse_id=$2`,
     `location_id=$3`,
-    `updated_at=NOW()`
+    `updated_at=NOW()`,
   ];
   const params = [toStatus, wh, lc];
 
   if (changingBarcode) {
-    sets.splice(3, 0, `barcode=$4`);             // updated_at’tan önce ekleyelim
+    sets.splice(3, 0, `barcode=$4`); // updated_at'tan önce ekle
     params.push(nextBarcode);
   }
 
-  // onaylanıyorsa approved_* de yaz
   if (setApproved) {
     sets.push(`approved_by=$${params.length + 1}`);
     params.push(actorId ?? null);
@@ -148,6 +179,5 @@ exports.updateApproval = async (client, table, {
   await client.query(sql, params);
 };
 
-
-// İstersen başka yerlerde ihtiyaç olursa diye pool’u da export edebilirsin:
+// İstersen başka yerlerde ihtiyaç olursa diye:
 exports.pool = pool;

@@ -7,11 +7,15 @@ function getActorId(req) {
 /** GET /products */
 exports.list = async (req, res) => {
   try {
-    const warehouseId = Number(req.query.warehouseId || 0);
-    const masterId    = Number(req.query.masterId || 0);
-    const search      = (req.query.search || "").trim();
+    const { search, warehouseId, statusId } = req.query;
 
-    const rows = await service.list({ warehouseId, masterId, search });
+    const filters = {
+      search: search ? String(search).trim() : undefined,
+      warehouseId: warehouseId ? Number(warehouseId) : undefined,
+      statusId: statusId ? Number(statusId) : undefined,
+    };
+
+    const rows = await service.list(filters);
     res.json(rows);
   } catch (err) {
     console.error("products list error:", err);

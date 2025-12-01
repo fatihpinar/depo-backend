@@ -3,39 +3,56 @@ const pool = require("../../../core/db/index");
 const { randomUUID } = require("crypto");
 
 /* -------- LIST -------- */
+/**
+ * Artık master/category/type yok.
+ * Tarif listesi, recipe_items içinden DISTINCT recipe_id + recipe_name ile geliyor.
+ * categoryId / typeId parametrelerini imza olarak tutuyoruz ama kullanmıyoruz (geriye dönük uyum için).
+ */
 exports.findMany = async ({ categoryId = 0, typeId = 0, search = "" } = {}) => {
   const params = [];
   let sql = `
     SELECT
-      m.id AS master_id,
-      m.recipe_id,
-      m.recipe_name,
-      COALESCE(m.display_label, m.recipe_name) AS display_label
-    FROM masters m
-    WHERE m.recipe_id IS NOT NULL
+      ri.recipe_id,
+      MIN(ri.recipe_name) AS recipe_name,
+      MIN(ri.created_at)  AS created_at
+    FROM recipe_items ri
   `;
-  if (categoryId > 0) { params.push(categoryId); sql += ` AND m.category_id = $${params.length}`; }
-  if (typeId     > 0) { params.push(typeId);     sql += ` AND m.type_id     = $${params.length}`; }
+
   if (search) {
-    const term = `%${search}%`;
-    params.push(term); const p = params.length;
-    sql += ` AND (m.recipe_name ILIKE $${p} OR m.display_label ILIKE $${p})`;
+    params.push(`%${search}%`);
+    sql += ` WHERE ri.recipe_name ILIKE $${params.length}`;
   }
-  sql += ` ORDER BY m.id DESC`;
+
+  sql += `
+    GROUP BY ri.recipe_id
+    ORDER BY created_at DESC
+  `;
+
   const { rows } = await pool.query(sql, params);
-  return rows;
+
+  // FE şu alanları bekliyordu: recipe_id, master_id, display_label
+  // master_id artık yok → null gönderiyoruz, label için recipe_name kullanıyoruz.
+  return rows.map((r) => ({
+    recipe_id: r.recipe_id,
+    recipe_name: r.recipe_name,
+    master_id: null,
+    display_label: r.recipe_name || r.recipe_id,
+  }));
 };
 
 /* -------- ITEMS -------- */
+
+// src/modules/products/recipes/recipes.repository.js
+
 exports.findItems = async (recipeId) => {
   const sql = `
     SELECT
       ri.component_master_id,
-      COALESCE(cm.display_label, cm.recipe_name) AS component_label,
+      pm.bimeks_product_name AS component_label,  -- 🔧 tek isim kaynağı
       ri.qty AS quantity,
       ri.unit
     FROM recipe_items ri
-    JOIN masters cm ON cm.id = ri.component_master_id
+    JOIN masters pm ON pm.id = ri.component_master_id
     WHERE ri.recipe_id = $1
     ORDER BY ri.id ASC
   `;
@@ -43,43 +60,56 @@ exports.findItems = async (recipeId) => {
   return rows;
 };
 
-/* -------- CREATE (helpers) -------- */
-exports.lockNameConflict = async (client, { category_id, type_id, recipe_name }) => {
+
+/* -------- CREATE yardımcıları -------- */
+
+/**
+ * Aynı isimde tarif var mı? (case-insensitive)
+ */
+exports.lockNameConflict = async (client, recipe_name) => {
   const { rows } = await client.query(
-    `SELECT 1
-       FROM masters
-      WHERE recipe_id IS NOT NULL
-        AND category_id = $1
-        AND type_id     = $2
-        AND LOWER(recipe_name) = LOWER($3)
-      LIMIT 1`,
-    [category_id, type_id, recipe_name]
+    `
+      SELECT 1
+      FROM recipe_items
+      WHERE LOWER(recipe_name) = LOWER($1)
+      LIMIT 1
+    `,
+    [recipe_name]
   );
   return !!rows.length;
 };
 
-exports.insertRecipeMaster = async (client, { category_id, type_id, recipe_id, recipe_name }) => {
-  const { rows } = await client.query(
-    `INSERT INTO masters
-       (category_id, type_id, display_label, recipe_id, recipe_name, created_at, updated_at)
-     VALUES ($1,$2,$3,$4,$5, NOW(), NOW())
-     RETURNING id`,
-    [category_id, type_id, recipe_name, recipe_id, recipe_name]
-  );
-  return rows[0].id;
-};
-
-exports.insertRecipeItems = async (client, recipe_id, items /* [{component_master_id, quantity, unit}] */) => {
+/**
+ * Tarif satırlarını ekler.
+ * items: [{ component_master_id, quantity, unit? }]
+ */
+exports.insertRecipeItems = async (
+  client,
+  recipe_id,
+  recipe_name,
+  items /* [{component_master_id, quantity, unit}] */
+) => {
   if (!items.length) return;
-  const cols = ["recipe_id", "component_master_id", "qty", "unit"];
+
+  const cols = ["recipe_id", "recipe_name", "component_master_id", "qty", "unit"];
   const vals = [];
   const params = [];
   let i = 0;
+
   for (const it of items) {
-    vals.push(`($${i + 1}, $${i + 2}, $${i + 3}, $${i + 4})`);
-    params.push(recipe_id, it.component_master_id, it.quantity, it.unit || "EA");
-    i += 4;
+    vals.push(
+      `($${i + 1}, $${i + 2}, $${i + 3}, $${i + 4}, $${i + 5})`
+    );
+    params.push(
+      recipe_id,
+      recipe_name,
+      it.component_master_id,
+      it.quantity,
+      it.unit || "EA"
+    );
+    i += 5;
   }
+
   await client.query(
     `INSERT INTO recipe_items (${cols.join(",")}) VALUES ${vals.join(",")}`,
     params
@@ -87,54 +117,75 @@ exports.insertRecipeItems = async (client, recipe_id, items /* [{component_maste
 };
 
 /* -------- CREATE (transaction) -------- */
+/**
+ * Yeni tarif oluşturur.
+ * Beklenen payload şekli:
+ * {
+ *   recipe_name: "Kırmızı Bant 50mm",
+ *   items: [{ component_master_id, quantity, unit? }]
+ * }
+ */
 exports.createRecipe = async (payload = {}) => {
   const client = await pool.connect();
+
   try {
     await client.query("BEGIN");
 
-    const master = payload.master || {};
+    const recipe_name = String(payload.recipe_name || "").trim();
     const rawItems = Array.isArray(payload.items) ? payload.items : [];
 
-    const category_id = Number(master.category_id || 0);
-    const type_id     = Number(master.type_id || 0);
-    const recipe_name = String(master.recipe_name || "").trim();
-
-    if (!category_id || !type_id || !recipe_name) {
+    if (!recipe_name || !rawItems.length) {
       const e = new Error("MISSING_FIELDS");
-      e.status = 400; e.code = "MISSING_FIELDS"; throw e;
+      e.status = 400;
+      e.code = "MISSING_FIELDS";
+      throw e;
     }
 
-    // benzersizlik
-    const hasConflict = await exports.lockNameConflict(client, { category_id, type_id, recipe_name });
+    // Benzersizlik kontrolü (isim bazlı)
+    const hasConflict = await exports.lockNameConflict(client, recipe_name);
     if (hasConflict) {
       const e = new Error("RECIPE_NAME_CONFLICT");
-      e.status = 409; e.code = "RECIPE_NAME_CONFLICT"; throw e;
+      e.status = 409;
+      e.code = "RECIPE_NAME_CONFLICT";
+      throw e;
     }
 
-    // master
+    // Tarif ID
     const recipe_id = randomUUID();
-    const master_id = await exports.insertRecipeMaster(client, {
-      category_id, type_id, recipe_id, recipe_name,
-    });
 
-    // items: aynı master toplanır, qty>0
-    const totals = new Map(); // master_id -> qty
+    // Aynı master için miktarları toparlayalım
+    const totals = new Map(); // master_id -> { quantity, unit }
     for (const it of rawItems) {
       const mid = Number(it.component_master_id || 0);
-      const q   = Number(it.quantity || 0);
+      const q = Number(it.quantity || 0);
       if (!mid || q <= 0) continue;
-      totals.set(mid, (totals.get(mid) || 0) + q);
+
+      const prev = totals.get(mid) || { quantity: 0, unit: it.unit || "EA" };
+      totals.set(mid, {
+        quantity: prev.quantity + q,
+        unit: it.unit || prev.unit || "EA",
+      });
     }
 
-    if (totals.size) {
-      const items = Array.from(totals.entries()).map(([component_master_id, quantity]) => ({
-        component_master_id, quantity, unit: "EA",
-      }));
-      await exports.insertRecipeItems(client, recipe_id, items);
+    const items = Array.from(totals.entries()).map(
+      ([component_master_id, v]) => ({
+        component_master_id,
+        quantity: v.quantity,
+        unit: v.unit || "EA",
+      })
+    );
+
+    if (!items.length) {
+      const e = new Error("MISSING_ITEMS");
+      e.status = 400;
+      e.code = "MISSING_ITEMS";
+      throw e;
     }
+
+    await exports.insertRecipeItems(client, recipe_id, recipe_name, items);
 
     await client.query("COMMIT");
-    return { master_id, recipe_id, recipe_name };
+    return { recipe_id, recipe_name };
   } catch (err) {
     await client.query("ROLLBACK");
     throw err;

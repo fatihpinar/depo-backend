@@ -5,21 +5,31 @@ function getActorId(req) {
 }
 
 // GET /components
-exports.list = async (req, res) => {
-  try {
-    const search       = (req.query.search || "").trim();
-    const warehouseId  = Number(req.query.warehouseId || 0);
-    const locationId   = Number(req.query.locationId  || 0);
-    const masterId     = Number(req.query.masterId    || 0);
-    const availableOnly = String(req.query.availableOnly || "false") === "true";
+// src/modules/components/components.controller.js
 
-    const rows = await service.list({ search, warehouseId, locationId, masterId, availableOnly });
+exports.list = async (req, res, next) => {
+  try {
+    const {
+      search,
+      warehouseId,
+      masterId,
+      statusId,          // 👈 EKLE
+    } = req.query;
+
+    const filters = {
+      search: search || undefined,
+      warehouseId: warehouseId ? Number(warehouseId) : undefined,
+      masterId: masterId ? Number(masterId) : undefined,
+      statusId: statusId ? Number(statusId) : undefined,  // 👈 EKLE
+    };
+
+    const rows = await service.list(filters);
     res.json(rows);
   } catch (err) {
-    console.error("components list error:", err);
-    res.status(500).json({ message: "Internal error" });
+    next(err);
   }
 };
+
 
 // GET /components/:id
 exports.getById = async (req, res) => {
@@ -59,6 +69,28 @@ exports.bulkCreate = async (req, res) => {
   } catch (err) {
     if (err.status) return res.status(err.status).json({ code: err.code, conflicts: err.conflicts, message: err.message });
     console.error("components bulkCreate error:", err);
+    res.status(500).json({ message: "Internal error" });
+  }
+};
+
+exports.exitMany = async (req, res) => {
+  try {
+    const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
+    if (!rows.length) {
+      return res.status(400).json({ message: "Boş satır listesi" });
+    }
+
+    const actorId = getActorId(req);
+    const result = await service.exitMany(rows, actorId);
+
+    res.json({ items: result });
+  } catch (err) {
+    if (err.status) {
+      return res
+        .status(err.status)
+        .json({ code: err.code, message: err.message });
+    }
+    console.error("components exitMany error:", err);
     res.status(500).json({ message: "Internal error" });
   }
 };
