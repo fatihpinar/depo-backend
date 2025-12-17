@@ -1,7 +1,12 @@
 // src/modules/approvals/approvals.service.js
-const { recordTransitions, makeBatchId } = require("../transitions/transitions.service");
 const { ITEM_TYPE, ACTION } = require("../transitions/transitions.constants");
 const { assertFormatAndKind, assertAndConsume } = require("../../core/barcode/barcode.service");
+const {
+  recordTransitions,
+  makeBatchId,
+  applyStockBalancesForComponentTransitions,   // 👈 eklendi
+} = require("../transitions/transitions.service");
+
 
 const repo = require("./approvals.repository");
 const { STATUS, LIST_STATUS_BY_SCOPE, DEPT_BY_SCOPE, KIND_TABLE } =
@@ -62,10 +67,12 @@ exports.approveItems = async (scope = "stock", items = [], actorId = null) => {
         e.status = 404; throw e;
       }
 
-      const prevStatus = Number(prev.status_id);
+      const prevStatus = Number(prev.status_id);      // 👈 EKSİK OLAN SATIR
       const prevWh = Number(prev.warehouse_id || 0);
       const prevLc = Number(prev.location_id || 0);
       const unit = prev.unit || it.unit || "EA";
+      const prevArea = Number(prev.area || 0);  // 👈 yeni
+
 
       // Hedef statü (scope ve hedef deponun departmanına göre)
       let toStatus;
@@ -128,7 +135,34 @@ exports.approveItems = async (scope = "stock", items = [], actorId = null) => {
           to_location_id:    lc,
         });
       }
+            // Transitions
+      if (willMove) {
+        transitions.push({
+          item_type: it.kind === "component" ? ITEM_TYPE.COMPONENT : ITEM_TYPE.PRODUCT,
+          item_id: id,
+          action: ACTION.MOVE,
+          qty_delta: 0,
+          unit,
+          from_warehouse_id: prevWh || null,
+          from_location_id:  prevLc || null,
+          to_warehouse_id:   wh,
+          to_location_id:    lc,
+        });
+      }
+
+     // 🔹 Statü değişiyorsa APPROVE kaydı
+      //    + eğer bu sırada barkod da değişmişse, meta içine göm
       if (prevStatus !== toStatus) {
+        const approveMeta = changingBarcode
+          ? {
+              field: "barcode",
+              before: current || null,
+              after: nextBarcode,
+              reason: "approve",
+            }
+          : null;
+
+        // 1) Tarihçe için APPROVE transition
         transitions.push({
           item_type: it.kind === "component" ? ITEM_TYPE.COMPONENT : ITEM_TYPE.PRODUCT,
           item_id: id,
@@ -137,25 +171,80 @@ exports.approveItems = async (scope = "stock", items = [], actorId = null) => {
           unit,
           from_status_id: prevStatus,
           to_status_id: toStatus,
+          from_warehouse_id: prevWh || null,
+          from_location_id:  prevLc || null,
+          to_warehouse_id:   wh,
+          to_location_id:    lc,
+          meta: approveMeta,
         });
+
+        // 2) Stok bakiyesi için pending → in_stock taşı (sadece component)
+        if (it.kind === "component" && prevArea > 0) {
+          // 2.a) Eski statüden düş (ör: pending)
+          transitions.push({
+            item_type: ITEM_TYPE.COMPONENT,
+            item_id: id,
+            action: ACTION.ADJUST,
+            qty_delta: -1,
+            unit,
+            from_status_id: prevStatus,
+            to_status_id: prevStatus,
+            from_warehouse_id: prevWh || null,
+            from_location_id:  prevLc || null,
+            to_warehouse_id:   prevWh || null,
+            to_location_id:    prevLc || null,
+            meta: {
+              // applyStockBalancesForComponentTransitions: consumed_area ⇒ area_sum'dan düş
+              consumed_area: prevArea,
+            },
+          });
+
+          // 2.b) Yeni statüye ekle (ör: in_stock)
+          transitions.push({
+            item_type: ITEM_TYPE.COMPONENT,
+            item_id: id,
+            action: ACTION.ADJUST,
+            qty_delta: +1,
+            unit,
+            from_status_id: toStatus,
+            to_status_id: toStatus,
+            from_warehouse_id: wh,
+            from_location_id:  lc,
+            to_warehouse_id:   wh,
+            to_location_id:    lc,
+            meta: {
+              // area ⇒ area_sum'a ekle
+              area: prevArea,
+            },
+          });
+        }
       }
-      if (changingBarcode) {
+      // 🔹 Statü değişmiyor, sadece barkod edit edildiyse
+      //    (örneğin ileride düzeltme ekranından) ATTRIBUTE_CHANGE kullan
+      else if (changingBarcode) {
         transitions.push({
           item_type: it.kind === "component" ? ITEM_TYPE.COMPONENT : ITEM_TYPE.PRODUCT,
           item_id: id,
           action: ACTION.ATTRIBUTE_CHANGE,
           qty_delta: 0,
           unit,
-          meta: { field: "barcode", before: current || null, after: nextBarcode },
+          meta: {
+            field: "barcode",
+            before: current || null,
+            after: nextBarcode,
+            reason: "edit",
+          },
         });
       }
     }
 
-    if (transitions.length) {
-      await recordTransitions(client, batchId, transitions, actorId); // 👈 actor_user_id yaz
+        if (transitions.length) {
+      await recordTransitions(client, batchId, transitions, actorId);
+      await applyStockBalancesForComponentTransitions(client, transitions);
     }
 
     return { ok: true, approved: items.length };
+
   });
 };
 

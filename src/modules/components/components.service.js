@@ -2,9 +2,10 @@
 const pool = require("../../core/db/index");
 const repo = require("./components.repository");
 const { mapRowToApi } = require("./components.mappers");
+const { recordTransitions, makeBatchId, applyStockBalancesForComponentTransitions } =
+  require("../transitions/transitions.service");
 
 
-const { recordTransitions, makeBatchId } = require("../transitions/transitions.service");
 const { ITEM_TYPE, ACTION } = require("../transitions/transitions.constants");
 
 const {
@@ -38,6 +39,10 @@ exports.getById = async (id) => {
 
 /* =============== UPDATE =============== */
 
+// src/modules/components/components.service.js
+
+// src/modules/components/components.service.js
+
 exports.update = async (id, payload = {}, actorId = null) => {
   const client = await pool.connect();
   try {
@@ -50,15 +55,20 @@ exports.update = async (id, payload = {}, actorId = null) => {
       throw e;
     }
 
-    // 1) in_stock'a geçişte barkod zorunlu
-    if (
-      payload.status_id !== undefined &&
-      Number(payload.status_id) === STATUS.in_stock
-    ) {
+    // master değişebilir → doğru unit için master_id belirle
+    const nextMasterId =
+      payload.master_id !== undefined ? Number(payload.master_id) : Number(before.master_id);
+
+    const { rows: ms } = await client.query(
+      `SELECT id, stock_unit FROM masters WHERE id = $1`,
+      [nextMasterId]
+    );
+    const stockUnit = (ms[0]?.stock_unit || "").toString().trim().toLowerCase();
+
+    // Barkod zorunluluğu (senin kuralın)
+    if (payload.status_id !== undefined && Number(payload.status_id) === STATUS.in_stock) {
       const planned =
-        payload.barcode !== undefined
-          ? normalize(payload.barcode)
-          : normalize(before.barcode);
+        payload.barcode !== undefined ? normalize(payload.barcode) : normalize(before.barcode);
       if (!planned) {
         const e = new Error("BARCODE_REQUIRED_FOR_IN_STOCK");
         e.status = 400;
@@ -67,8 +77,8 @@ exports.update = async (id, payload = {}, actorId = null) => {
       }
     }
 
-    // 2) Barkod değişimi/çakışma/pool tüketme
-    const { nextBarcode, changed } = await ensureChangeAndConsume(client, {
+    // Barkod değişimi/çakışma/pool tüketme
+    const { nextBarcode } = await ensureChangeAndConsume(client, {
       table: "components",
       id,
       kind: "component",
@@ -80,166 +90,99 @@ exports.update = async (id, payload = {}, actorId = null) => {
       },
     });
 
-    // 3) En / boy zorunlu + alan hesaplama
-    let nextWidth =
-      payload.width !== undefined ? payload.width : before.width;
-    let nextHeight =
-      payload.height !== undefined ? payload.height : before.height;
-
-    // Boş bırakma yasak
-    if (
-      nextWidth === null ||
-      nextWidth === "" ||
-      nextHeight === null ||
-      nextHeight === ""
-    ) {
-      const e = new Error("DIMENSIONS_REQUIRED");
-      e.status = 400;
-      e.code = "DIMENSIONS_REQUIRED";
-      e.message = "En ve boy alanları zorunludur.";
-      throw e;
-    }
-
-    nextWidth = Number(nextWidth);
-    nextHeight = Number(nextHeight);
-
-    if (
-      !Number.isFinite(nextWidth) ||
-      !Number.isFinite(nextHeight) ||
-      nextWidth <= 0 ||
-      nextHeight <= 0
-    ) {
-      const e = new Error("DIMENSIONS_INVALID");
-      e.status = 400;
-      e.code = "DIMENSIONS_INVALID";
-      e.message = "En ve boy 0'dan büyük sayısal değerler olmalıdır.";
-      throw e;
-    }
-
-    const nextArea = nextWidth * nextHeight;
-
-    // 4) Güncellenecek alanları topla
+    // Güncellenecek alanları topla (ortak alanlar)
     const fields = {};
-
-    // quantity / unit yok; status vs.
-    for (const k of [
-      "master_id",
-      "status_id",
-      "warehouse_id",
-      "location_id",
-      "notes",
-      "invoice_no",
-    ]) {
+    for (const k of ["master_id", "status_id", "warehouse_id", "location_id", "notes", "invoice_no"]) {
       if (payload[k] !== undefined) fields[k] = payload[k];
     }
-
-    // width / height / area her durumda normalize edilmiş haliyle set ediliyor
-    fields.width = nextWidth;
-    fields.height = nextHeight;
-    fields.area = nextArea;
 
     if (payload.barcode !== undefined) {
       fields.barcode = nextBarcode;
     }
 
-    // 5) Onay bilgisi
+    // ✅ stock_unit'e göre zorunlu alan + normalize
+    const getNumOrNull = (v) =>
+      v === undefined || v === null || v === "" ? null : Number(v);
+
+    // hangi değeri baz alacağız? payload varsa onu, yoksa before'u
+    const nextWidth  = payload.width  !== undefined ? getNumOrNull(payload.width)  : getNumOrNull(before.width);
+    const nextHeight = payload.height !== undefined ? getNumOrNull(payload.height) : getNumOrNull(before.height);
+    const nextWeight = payload.weight !== undefined ? getNumOrNull(payload.weight) : getNumOrNull(before.weight);
+    const nextLength = payload.length !== undefined ? getNumOrNull(payload.length) : getNumOrNull(before.length);
+
+    if (stockUnit === "area") {
+      if (!Number.isFinite(nextWidth) || nextWidth <= 0 || !Number.isFinite(nextHeight) || nextHeight <= 0) {
+        const e = new Error("DIMENSIONS_REQUIRED");
+        e.status = 400;
+        e.code = "DIMENSIONS_REQUIRED";
+        e.message = "area biriminde En ve Boy zorunludur (0'dan büyük).";
+        throw e;
+      }
+      fields.width = nextWidth;
+      fields.height = nextHeight;
+      fields.area = nextWidth * nextHeight;
+
+      // diğer ölçüler temiz
+      fields.weight = null;
+      fields.length = null;
+    } else if (stockUnit === "weight") {
+      if (!Number.isFinite(nextWeight) || nextWeight <= 0) {
+        const e = new Error("WEIGHT_REQUIRED");
+        e.status = 400;
+        e.code = "WEIGHT_REQUIRED";
+        e.message = "weight biriminde Ağırlık zorunludur (0'dan büyük).";
+        throw e;
+      }
+      fields.weight = nextWeight;
+
+      // area alanlarını temiz
+      fields.width = null;
+      fields.height = null;
+      fields.area = null;
+      fields.length = null;
+    } else if (stockUnit === "length") {
+      if (!Number.isFinite(nextLength) || nextLength <= 0) {
+        const e = new Error("LENGTH_REQUIRED");
+        e.status = 400;
+        e.code = "LENGTH_REQUIRED";
+        e.message = "length biriminde Uzunluk zorunludur (0'dan büyük).";
+        throw e;
+      }
+      fields.length = nextLength;
+
+      // area alanlarını temiz
+      fields.width = null;
+      fields.height = null;
+      fields.area = null;
+      fields.weight = null;
+    } else if (stockUnit === "unit") {
+      // ölçü yok → hepsini temizle (istersen mevcutları koru diyebilirsin)
+      fields.width = null;
+      fields.height = null;
+      fields.area = null;
+      fields.weight = null;
+      fields.length = null;
+    } else {
+      const e = new Error("MASTER_STOCK_UNIT_INVALID");
+      e.status = 400;
+      e.code = "MASTER_STOCK_UNIT_INVALID";
+      e.message = `master_id=${nextMasterId} için stock_unit geçersiz/boş: "${stockUnit}"`;
+      throw e;
+    }
+
+    // Onay bilgisi (senin kuralın)
     let isApproval = false;
     if (payload.status_id !== undefined) {
       const to = Number(payload.status_id);
       const from = Number(before.status_id);
-      if (from !== to && to === STATUS.in_stock) {
-        isApproval = true;
-      }
+      if (from !== to && to === STATUS.in_stock) isApproval = true;
     }
     if (isApproval && actorId) {
       fields.approved_by = actorId;
-      // approved_at repo.updateFields içinde NOW() ile set ediliyor (approved_by gelince)
+      // approved_at repo.updateFields içinde NOW() ile set ediliyor
     }
 
-    // 6) DB update
-    const after = await repo.updateFields(client, id, fields);
-
-    // 7) Transitions
-    const recs = [];
-    const batchId = makeBatchId();
-    const UNIT_LABEL = "EA"; // her satır 1 adet parça gibi düşünüyoruz
-
-    // statü değişti mi?
-    if (
-      payload.status_id !== undefined &&
-      Number(before.status_id) !== Number(after.status_id)
-    ) {
-      recs.push({
-        item_type: ITEM_TYPE.COMPONENT,
-        item_id: id,
-        action: ACTION.STATUS_CHANGE,
-        qty_delta: 0,
-        unit: UNIT_LABEL,
-        from_status_id: before.status_id,
-        to_status_id: after.status_id,
-      });
-    }
-
-    // depo / lokasyon değişti mi?
-    const whChanged =
-      payload.warehouse_id !== undefined &&
-      Number(before.warehouse_id || 0) !== Number(after.warehouse_id || 0);
-    const locChanged =
-      payload.location_id !== undefined &&
-      Number(before.location_id || 0) !== Number(after.location_id || 0);
-
-    if (whChanged || locChanged) {
-      recs.push({
-        item_type: ITEM_TYPE.COMPONENT,
-        item_id: id,
-        action: ACTION.MOVE,
-        qty_delta: 0,
-        unit: UNIT_LABEL,
-        from_warehouse_id: before.warehouse_id || null,
-        from_location_id: before.location_id || null,
-        to_warehouse_id: after.warehouse_id || null,
-        to_location_id: after.location_id || null,
-      });
-    }
-
-    // barkod değişti mi?
-    if (changed) {
-      recs.push({
-        item_type: ITEM_TYPE.COMPONENT,
-        item_id: id,
-        action: ACTION.ATTRIBUTE_CHANGE,
-        qty_delta: 0,
-        unit: UNIT_LABEL,
-        meta: {
-          field: "barcode",
-          before: before.barcode || null,
-          after: nextBarcode || null,
-        },
-      });
-    }
-
-    // fatura no değişti mi?
-    if (
-      payload.invoice_no !== undefined &&
-      String(before.invoice_no || "") !== String(after.invoice_no || "")
-    ) {
-      recs.push({
-        item_type: ITEM_TYPE.COMPONENT,
-        item_id: id,
-        action: ACTION.ATTRIBUTE_CHANGE,
-        qty_delta: 0,
-        unit: UNIT_LABEL,
-        meta: {
-          field: "invoice_no",
-          before: before.invoice_no || null,
-          after: after.invoice_no || null,
-        },
-      });
-    }
-
-    if (recs.length) {
-      await recordTransitions(client, batchId, recs, { actorId });
-    }
+    await repo.updateFields(client, id, fields);
 
     await client.query("COMMIT");
     const full = await repo.findById(id);
@@ -254,6 +197,8 @@ exports.update = async (id, payload = {}, actorId = null) => {
 
 
 
+
+
 /* =============== BULK CREATE =============== */
 
 exports.bulkCreate = async (entries, { actorId } = {}) => {
@@ -261,66 +206,88 @@ exports.bulkCreate = async (entries, { actorId } = {}) => {
   try {
     await client.query("BEGIN");
 
-    const prepared = entries.map((e) => {
-      const width =
-        e.width !== undefined && e.width !== null && e.width !== ""
-          ? Number(e.width)
-          : null;
+    const masterIds = [...new Set(entries.map(e => Number(e.master_id)).filter(Boolean))];
+    const { rows: ms } = await client.query(
+      `SELECT id, stock_unit FROM masters WHERE id = ANY($1)`,
+      [masterIds]
+    );
+    const masterUnitById = new Map(
+      ms.map(x => [Number(x.id), (x.stock_unit || "").toString().trim().toLowerCase()])
+    );
 
-      const height =
-        e.height !== undefined && e.height !== null && e.height !== ""
-          ? Number(e.height)
-          : null;
+    const numOrNull = (v) => (v === undefined || v === null || v === "" ? null : Number(v));
 
-      const area =
-        width !== null && height !== null ? width * height : null;
+    const prepared = entries.map((e, idx) => {
+      const master_id = Number(e.master_id);
+      const stockUnit = masterUnitById.get(master_id) || "";
 
-      return {
-        master_id: Number(e.master_id),
+      const width  = numOrNull(e.width);
+      const height = numOrNull(e.height);
+      const weight = numOrNull(e.weight);
+      const length = numOrNull(e.length);
+
+      let out = {
+        master_id,
         barcode: normalize(e.barcode),
         status_id: STATUS.pending,
         warehouse_id: Number(e.warehouse_id),
         location_id: Number(e.location_id),
-        width,
-        height,
-        area,
+        width: null,
+        height: null,
+        area: null,
+        weight: null,
+        length: null,
         invoice_no: e.invoice_no ?? null,
         created_by: actorId || null,
       };
-    });
 
-        // 🔴 En / boy zorunlu + pozitif olmalı
-    const dimErrors = [];
-    prepared.forEach((e, idx) => {
-      if (e.width === null || e.height === null) {
-        dimErrors.push({
-          index: idx,
-          field: "width_height",
-          message: "En ve boy zorunludur.",
-        });
-      } else if (
-        !Number.isFinite(e.width) ||
-        !Number.isFinite(e.height) ||
-        e.width <= 0 ||
-        e.height <= 0
-      ) {
-        dimErrors.push({
-          index: idx,
-          field: "width_height",
-          message: "En ve boy 0'dan büyük sayılar olmalıdır.",
-        });
+      if (stockUnit === "area") {
+        if (!Number.isFinite(width) || width <= 0 || !Number.isFinite(height) || height <= 0) {
+          const err = new Error("VALIDATION_ERROR");
+          err.status = 400;
+          err.code = "VALIDATION_ERROR";
+          err.errors = [{ index: idx, field: "width_height", message: "area biriminde En ve Boy zorunludur." }];
+          throw err;
+        }
+        out.width = width;
+        out.height = height;
+        out.area = width * height;
+
+      } else if (stockUnit === "weight") {
+        if (!Number.isFinite(weight) || weight <= 0) {
+          const err = new Error("VALIDATION_ERROR");
+          err.status = 400;
+          err.code = "VALIDATION_ERROR";
+          err.errors = [{ index: idx, field: "weight", message: "weight biriminde Ağırlık zorunludur." }];
+          throw err;
+        }
+        out.weight = weight;
+
+      } else if (stockUnit === "length") {
+        if (!Number.isFinite(length) || length <= 0) {
+          const err = new Error("VALIDATION_ERROR");
+          err.status = 400;
+          err.code = "VALIDATION_ERROR";
+          err.errors = [{ index: idx, field: "length", message: "length biriminde Uzunluk zorunludur." }];
+          throw err;
+        }
+        out.length = length;
+
+      } else if (stockUnit === "unit") {
+        // ölçü yok → hepsi null
+
+      } else {
+        const err = new Error("MASTER_STOCK_UNIT_INVALID");
+        err.status = 400;
+        err.code = "MASTER_STOCK_UNIT_INVALID";
+        err.message = `master_id=${master_id} için stock_unit geçersiz/boş: "${stockUnit}"`;
+        throw err;
       }
+
+      return out;
     });
 
-    if (dimErrors.length) {
-      const err = new Error("VALIDATION_ERROR");
-      err.status = 400;
-      err.code = "VALIDATION_ERROR";
-      err.errors = dimErrors;
-      throw err;
-    }
-
-
+    // barkod format/çakışma
     for (const e of prepared) {
       if (e.barcode) assertFormatAndKind(e.barcode, "component");
     }
@@ -349,23 +316,32 @@ exports.bulkCreate = async (entries, { actorId } = {}) => {
       });
     }
 
+    // transitions
     const UNIT_LABEL = "EA";
     const batchId = makeBatchId();
+
     const recs = rows.map((r) => ({
       item_type: ITEM_TYPE.COMPONENT,
       item_id: r.id,
       action: ACTION.CREATE,
-      qty_delta: 1, // her satır 1 fiziksel parça
+      qty_delta: 1,
       unit: UNIT_LABEL,
       to_status_id: STATUS.pending,
       to_warehouse_id: r.warehouse_id || null,
       to_location_id: r.location_id || null,
+      meta: {
+        area: r.area ?? null,
+        weight: r.weight ?? null,
+        length: r.length ?? null,
+      },
     }));
 
     await recordTransitions(client, batchId, recs, { actorId });
+    await applyStockBalancesForComponentTransitions(client, recs);
 
     await client.query("COMMIT");
-    return rows.map(mapRowToApi); 
+    return rows.map(mapRowToApi);
+
   } catch (err) {
     await client.query("ROLLBACK");
     throw err;
@@ -373,6 +349,9 @@ exports.bulkCreate = async (entries, { actorId } = {}) => {
     client.release();
   }
 };
+
+
+// src/modules/components/components.service.js
 
 exports.exitMany = async (payload, actorId = null) => {
   // 🔹 1) Payload'ı normalize et
@@ -399,16 +378,16 @@ exports.exitMany = async (payload, actorId = null) => {
 
     const transitions = [];
 
-    for (const raw of rows) {
+      for (const raw of rows) {
       const compId = Number(raw.component_id || 0);
       const target = raw.target === "stock" ? "stock" : "sale"; // default: sale
-      const qty = Number(raw.consume_qty || 0);
+      const qty = Number(raw.consume_qty || 0);                 // sadece sale için anlamlı
 
-      if (!compId || !Number.isFinite(qty) || qty <= 0) {
+      if (!compId) {
         const e = new Error("INVALID_ROW");
         e.status = 400;
         e.code = "INVALID_ROW";
-        e.details = { compId, qty };
+        e.details = { compId };
         throw e;
       }
 
@@ -422,7 +401,7 @@ exports.exitMany = async (payload, actorId = null) => {
       }
 
       const have = Number(c.area || 0);
-      if (!Number.isFinite(have) || have <= 0 || qty > have) {
+      if (!Number.isFinite(have) || have <= 0) {
         const e = new Error("CONSUME_GT_STOCK");
         e.status = 409;
         e.code = "CONSUME_GT_STOCK";
@@ -430,37 +409,72 @@ exports.exitMany = async (payload, actorId = null) => {
         throw e;
       }
 
-      const left = have - qty; // kalan alan
-      const UNIT_LABEL = "m²"; // sende hangi birim mantıklıysa onu yaz
+      const UNIT_LABEL = "EA";
 
+      /* ================== 1) SATIŞ (target === "sale") ================== */
       if (target === "sale") {
-        // 🔹 SATIŞ → statü her durumda Satıldı
-        const newStatus = STATUS.sold;
+        if (!Number.isFinite(qty) || qty <= 0) {
+          const e = new Error("INVALID_ROW");
+          e.status = 400;
+          e.code = "INVALID_ROW";
+          e.details = { compId, qty };
+          throw e;
+        }
+
+        if (qty > have) {
+          const e = new Error("CONSUME_GT_STOCK");
+          e.status = 409;
+          e.code = "CONSUME_GT_STOCK";
+          e.details = { have, qty };
+          throw e;
+        }
+
+        let left = have - qty; // kalan alan
+
+        // 🔹 SATIŞ:
+        //  - KISMİ satışta statü DEĞİŞMEZ (ör: in_stock → in_stock)
+        //  - TAM satışta statü Satıldı'ya gider
+        let newStatus = c.status_id;
+
+        const fullyConsumed = left <= 0;
+        if (fullyConsumed) {
+          left = 0;
+          newStatus = STATUS.sold;
+        }
 
         await repo.updateFields(client, c.id, {
           area: left,
           status_id: newStatus,
         });
 
-        // 🔹 TRANSITION: tüketim + statü değişimi
         transitions.push({
           item_type: ITEM_TYPE.COMPONENT,
           item_id: c.id,
-          action: ACTION.CONSUME,      // aksiyon: tüketim
-          qty_delta: -qty,
+          action: ACTION.CONSUME,      // tüketim
+          qty_delta: 0,                // 👈 adet değişmiyor
           unit: UNIT_LABEL,
           from_status_id: c.status_id,
-          to_status_id: newStatus,      // ⬅ 3 (Satıldı)
+          to_status_id: newStatus,
           from_warehouse_id: c.warehouse_id || null,
           from_location_id: c.location_id || null,
           to_warehouse_id: c.warehouse_id || null,
           to_location_id: c.location_id || null,
           context_type: "component_exit",
           context_id: null,
-          meta: { target: "sale" },
+          meta: {
+            target: "sale",
+            consumed_area: qty,        // 👈 sadece alan azalacak
+            remaining_area: left,
+            fully_consumed: fullyConsumed,
+          },
         });
-      } else {
-        // 🔹 target === "stock" → başka depoya/loc'a çıkış
+      }
+
+      /* ============ 2) DEPOYA TRANSFER (target === "stock") ============= */
+      else {
+        // 🔹 Burada artık PARÇALI taşıma YOK.
+        //    Her zaman komponentin TÜM alanını yeni depo/lokasyona taşıyoruz.
+
         const whId = Number(raw.warehouse_id || 0);
         const locId = Number(raw.location_id || 0);
         if (!whId || !locId) {
@@ -470,40 +484,80 @@ exports.exitMany = async (payload, actorId = null) => {
           throw e;
         }
 
-        const newStatus = STATUS.in_stock;
+        const beforeStatus = c.status_id;
+        const beforeWh = c.warehouse_id || null;
+        const beforeLc = c.location_id || null;
 
+        // Statü değişmiyor, sadece depo/lokasyon değişiyor
+        const newStatus = beforeStatus;
+
+        // Komponent kaydını güncelle:
+        //  - alan değişmiyor (have)
+        //  - yeni depo/lokasyon yazılıyor
         await repo.updateFields(client, c.id, {
-          area: left,
+          area: have,
           status_id: newStatus,
           warehouse_id: whId,
           location_id: locId,
         });
 
+        // 1) Eski depo/lokasyondan tamamını düş
         transitions.push({
           item_type: ITEM_TYPE.COMPONENT,
           item_id: c.id,
-          action: ACTION.MOVE,
-          qty_delta: -qty,
+          action: ACTION.ADJUST,
+          qty_delta: 0, // sadece area_sum için çalışıyoruz
           unit: UNIT_LABEL,
-          from_status_id: c.status_id,
+          from_status_id: beforeStatus,
+          to_status_id: beforeStatus,
+          from_warehouse_id: beforeWh,
+          from_location_id: beforeLc,
+          to_warehouse_id: beforeWh,
+          to_location_id: beforeLc,
+          context_type: "component_exit",
+          context_id: null,
+          meta: {
+            target: "stock",
+            consumed_area: have,  // stock_balances: area_sum -= have
+            remaining_area: 0,
+            move_full: true,
+          },
+        });
+
+        // 2) Yeni depo/lokasyona tamamını ekle
+        transitions.push({
+          item_type: ITEM_TYPE.COMPONENT,
+          item_id: c.id,
+          action: ACTION.ADJUST,
+          qty_delta: 0,
+          unit: UNIT_LABEL,
+          from_status_id: newStatus,
           to_status_id: newStatus,
-          from_warehouse_id: c.warehouse_id || null,
-          from_location_id: c.location_id || null,
+          from_warehouse_id: whId,
+          from_location_id: locId,
           to_warehouse_id: whId,
           to_location_id: locId,
           context_type: "component_exit",
           context_id: null,
-          meta: { target: "stock" },
+          meta: {
+            target: "stock",
+            area: have,          // stock_balances: area_sum += have
+            remaining_area: have,
+            move_full: true,
+          },
         });
       }
     }
 
-    if (transitions.length) {
+
+      if (transitions.length) {
       const batchId = makeBatchId();
       await recordTransitions(client, batchId, transitions, { actorId });
+      await applyStockBalancesForComponentTransitions(client, transitions);
     }
 
     await client.query("COMMIT");
+
     return { processed: rows.length };
   } catch (err) {
     await client.query("ROLLBACK");
@@ -512,4 +566,5 @@ exports.exitMany = async (payload, actorId = null) => {
     client.release();
   }
 };
+
 

@@ -8,6 +8,10 @@ exports.mapRowToApi = (r) => ({
   width: r.width ?? null,
   height: r.height ?? null,
   area: r.area ?? null,
+
+  weight: r.weight ?? null,
+  length: r.length ?? null,
+
   invoice_no: r.invoice_no ?? null,
 
   created_at: r.created_at,
@@ -44,11 +48,12 @@ exports.mapRowToApi = (r) => ({
     : undefined,
 
   master: r.master_id
-    ? {
-        id: r.master_id,
-        bimeks_product_name: r.master_bimeks_product_name || null, // 🔧 tek kaynak
-        bimeks_code: r.master_code || null,
-        length_unit: r.master_length_unit || null,
-      }
-    : undefined,
+  ? {
+      id: r.master_id,
+      bimeks_product_name: r.master_bimeks_product_name || null,
+      bimeks_code: r.master_bimeks_code || r.master_code || null,
+      stock_unit: r.master_stock_unit || null,
+      thickness_unit: r.master_thickness_unit || null,
+    }
+  : undefined,
 });

@@ -103,6 +103,25 @@ exports.listPendingUnion = async (
  * LOCK / LOOKUPS / UPDATE
  * --------------------------------------------------- */
 exports.lockItem = async (client, table, id) => {
+  if (table === "components") {
+    const { rows } = await client.query(
+      `SELECT
+         id,
+         barcode,
+         status_id,
+         warehouse_id,
+         location_id,
+         area,
+         'EA'::text AS unit
+       FROM components
+       WHERE id = $1
+       FOR UPDATE`,
+      [id]
+    );
+    return rows[0] || null;
+  }
+
+  // products tarafı (area yok, NULL dönsün)
   const { rows } = await client.query(
     `SELECT
        id,
@@ -110,14 +129,16 @@ exports.lockItem = async (client, table, id) => {
        status_id,
        warehouse_id,
        location_id,
-       'EA'::text AS unit   -- 🔧 components'ta kolon yok, products için de EA varsayıyoruz
-     FROM ${table}
-     WHERE id=$1
+       NULL::numeric AS area,
+       'EA'::text AS unit
+     FROM products
+     WHERE id = $1
      FOR UPDATE`,
     [id]
   );
   return rows[0] || null;
 };
+
 
 
 exports.getWarehouseDepartment = async (client, whId) => {

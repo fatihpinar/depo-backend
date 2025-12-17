@@ -1,6 +1,8 @@
+// src/modules/transitions/transitions.service.js
 const pool = require("../../core/db/index");
 const { randomUUID } = require("crypto");
 const { ITEM_TYPE, ACTION } = require("./transitions.constants");
+const stockRepo = require("../stock-balances/stockBalances.repository");
 
 /**
  * @typedef {Object} TransitionRecord
@@ -240,16 +242,173 @@ async function list({
   };
 }
 
+/**
+ * Component transition kayıtlarına göre stock_balances tablosunu günceller.
+ *
+ * - Stok bakiyesi master bazlı tutulur (master_id + depo + lokasyon + statü).
+ * - Aynı master/depo/lokasyon/statü kombinasyonuna ait tüm deltalar JS tarafında gruplanır.
+ * - Sonra tek bir INSERT ... ON CONFLICT ON CONSTRAINT ux_stock_balances_combo ile upsert edilir.
+ *
+ * Beklenen meta alanları:
+ *  - CREATE: meta.area (m²), component → master_id components tablosundan alınır
+ *  - CONSUME (sale): meta.consumed_area, meta.fully_consumed
+ *  - MOVE (stock):  meta.consumed_area (taşınan alan)
+ */
+async function applyStockBalancesForComponentTransitions(client, transitions) {
+  if (!Array.isArray(transitions) || transitions.length === 0) return;
+
+  // 1) Sadece component olanları al
+  const compTransitions = transitions.filter(
+    (t) => t.item_type === ITEM_TYPE.COMPONENT
+  );
+  if (!compTransitions.length) return;
+
+  // 2) Tekil component id listesi
+  const compIds = [
+    ...new Set(
+      compTransitions
+        .map((t) => Number(t.item_id || 0))
+        .filter((id) => Number.isFinite(id) && id > 0)
+    ),
+  ];
+  if (!compIds.length) return;
+
+  const db = client || (await pool.connect());
+  const shouldRelease = !client;
+
+  try {
+    // 3) Component → master_id map
+    const { rows: comps } = await db.query(
+      `SELECT id, master_id FROM components WHERE id = ANY($1::int[])`,
+      [compIds]
+    );
+
+    const masterByComponent = new Map();
+    for (const c of comps) {
+      masterByComponent.set(Number(c.id), Number(c.master_id));
+    }
+
+    // 4) Aynı kombinasyonları tek satırda toplayacağımız aggregate map
+    // key: masterId|statusId|whId|locId|unit
+    const aggregates = new Map();
+
+    const toNum = (v) => {
+      const n = Number(v);
+      return Number.isFinite(n) ? n : null;
+    };
+
+    for (const t of compTransitions) {
+      const compId = Number(t.item_id || 0);
+      const masterId = masterByComponent.get(compId);
+      if (!compId || !masterId) continue; // master'ı belli olmayanları atla
+
+      const statusId = Number(t.to_status_id || t.from_status_id || 0);
+      const whId = Number(t.to_warehouse_id || t.from_warehouse_id || 0);
+      const locId = Number(t.to_location_id || t.from_location_id || 0);
+      const unit = t.unit || "EA";
+
+      if (!statusId || !whId || !locId) {
+        // eksik bilgi varsa stok bakiyesi güncellemeyelim
+        continue;
+      }
+
+      // quantity değişimi (CREATE → +1 EA, CONSUME → -m², vs.)
+      const qtyDelta = Number(t.qty_delta || 0);
+
+      // area değişimi:
+      //  - CREATE meta.area → +area
+      //  - CONSUME meta.consumed_area → -consumed_area
+      let areaDelta = 0;
+      const meta = t.meta || {};
+
+      const consumed = toNum(meta.consumed_area);
+      const area = toNum(meta.area);
+
+      if (consumed !== null) {
+        areaDelta -= consumed;
+      } else if (area !== null) {
+        areaDelta += area;
+      }
+
+      if (qtyDelta === 0 && areaDelta === 0) continue;
+
+      const key = `${masterId}|${statusId}|${whId}|${locId}|${unit}`;
+
+      let agg = aggregates.get(key);
+      if (!agg) {
+        agg = {
+          masterId,
+          statusId,
+          whId,
+          locId,
+          unit,
+          qtyDelta: 0,
+          areaDelta: 0,
+        };
+        aggregates.set(key, agg);
+      }
+
+      agg.qtyDelta += qtyDelta;
+      agg.areaDelta += areaDelta;
+    }
+
+    if (!aggregates.size) return;
+
+    // 5) Toplanmış verileri tek INSERT ... ON CONFLICT ile bas
+    const values = [];
+    const placeholders = [];
+
+    for (const agg of aggregates.values()) {
+      const base = values.length;
+      placeholders.push(
+        `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6}, $${base + 7})`
+      );
+
+      values.push(
+        agg.masterId,   // master_id
+        agg.warehouseId ?? agg.whId, // eski isim ihtimali için (güvenlik)
+        agg.locId ?? agg.locationId ?? agg.locId,
+        agg.statusId,
+        agg.unit,
+        agg.qtyDelta,
+        agg.areaDelta
+      );
+    }
+
+    const sql = `
+      INSERT INTO stock_balances (
+        master_id,
+        warehouse_id,
+        location_id,
+        status_id,
+        unit,
+        quantity,
+        area_sum
+      )
+      VALUES
+        ${placeholders.join(", ")}
+      ON CONFLICT (master_id, warehouse_id, location_id, status_id, unit)
+      DO UPDATE SET
+        quantity = stock_balances.quantity + EXCLUDED.quantity,
+        area_sum = stock_balances.area_sum + EXCLUDED.area_sum;
+    `;
+
+    await db.query(sql, values);
+  } finally {
+    if (shouldRelease) db.release();
+  }
+}
+
+
 module.exports = {
-  // helpers
   makeBatchId,
   recordTransitions,
   listTransitions,
-
-  // query API
   list,
-
-  // re-export enums
   ITEM_TYPE,
   ACTION,
+  applyStockBalancesForComponentTransitions,
 };
+
+
+

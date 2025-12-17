@@ -36,12 +36,16 @@ const STATUS_LABEL_FALLBACK_TR = Object.freeze({
 });
 
 // ——— Yardımcılar ———
-// ——— Yardımcılar ———
 function translateActionTR(action, toStatusId, toStatusLabel, meta) {
-  // 🔹 Özel kural: component çıkışı ekranında "Hedef: Satış" ise
-  // BE meta.target = "sale" gönderiyor. Bunu yakalayıp başlığı "Satış" yapıyoruz.
+  // 🔹 Özel kural: component çıkışı ekranında "Hedef: Satış"
   if (action === ACTION.CONSUME && meta && meta.target === "sale") {
     return "Satış";
+  }
+
+  // 🔹 Özel kural: ilk yaratma → her zaman "Yeni kayıt" (veya "İlk giriş")
+  if (action === ACTION.CREATE) {
+    return ACTION_LABEL_TR.CREATE; // "Yeni kayıt"
+    // İstersen direkt: return "İlk giriş";
   }
 
   // 🔹 Önce statü label'ını kullan
@@ -53,7 +57,6 @@ function translateActionTR(action, toStatusId, toStatusLabel, meta) {
   // 🔹 Aksi halde aksiyon sözlüğüne düş
   return ACTION_LABEL_TR[action] || String(action);
 }
-
 
 function qtyText(delta, unit) {
   if (typeof delta !== "number" || !unit) return null;

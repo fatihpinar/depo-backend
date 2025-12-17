@@ -2,6 +2,7 @@ const express = require("express");
 const router = express.Router();
 
 const { middleware } = require("../modules/auth");
+const stockCtrl = require("../modules/stock-balances/stockBalances.controller");
 
 // Public
 router.use("/auth", require("../modules/auth").router);

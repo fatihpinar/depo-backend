@@ -9,7 +9,7 @@ exports.list = async ({
   search = "",
   limit = 50,
   offset = 0,
-  inStockOnly = false, // <- opsiyon
+  inStockOnly = false,
 }) => {
   // inStockOnly aktifse ve statusId gelmemişse 1 (in_stock) olarak sabitle
   if (
@@ -33,8 +33,17 @@ exports.list = async ({
         c.id        AS item_id,
         c.barcode   AS barcode,
         COALESCE(m.bimeks_product_name, CONCAT('#', m.id)) AS name,
-        m.length_unit AS unit,
-        c.area::float8 AS quantity,           -- 🔴 BURAYI DEĞİŞTİRDİK
+        m.stock_unit AS unit,
+
+        -- ✅ ölçü birimine göre miktar
+        CASE
+          WHEN m.stock_unit = 'area'   THEN COALESCE(c.area, 0)::float8
+          WHEN m.stock_unit = 'weight' THEN COALESCE(c.weight, 0)::float8
+          WHEN m.stock_unit = 'length' THEN COALESCE(c.length, 0)::float8
+          WHEN m.stock_unit = 'unit'   THEN 1::float8
+          ELSE COALESCE(c.area, 0)::float8
+        END AS quantity,
+
         st.id       AS status_id,
         COALESCE(st.label, st.code) AS status_label,
         w.id        AS warehouse_id, w.name AS warehouse_name,
@@ -45,7 +54,7 @@ exports.list = async ({
       JOIN statuses  st ON st.id = c.status_id
       LEFT JOIN warehouses w ON w.id = c.warehouse_id
       LEFT JOIN locations  l ON l.id = c.location_id
-      WHERE c.area > 0
+      -- ✅ sadece statü/filtreler belirlesin; burada area>0 yok
     )
     UNION ALL
     (
@@ -54,8 +63,8 @@ exports.list = async ({
         p.id      AS item_id,
         p.barcode AS barcode,
         COALESCE(p.product_name, CONCAT('#', p.id)) AS name,
-        'Adet'    AS unit,
-        1         AS quantity,
+        'unit'    AS unit,          -- istersen 'Adet' bırakabilirsin
+        1::float8 AS quantity,
         st.id     AS status_id,
         COALESCE(st.label, st.code) AS status_label,
         w.id      AS warehouse_id, w.name AS warehouse_name,

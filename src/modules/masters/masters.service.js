@@ -4,8 +4,8 @@ const repo = require("./masters.repository");
 
 
 // ---- LIST / DETAIL ----
-exports.list = async ({ productTypeId = 0, carrierTypeId = 0, search = "" } = {}) => {
-  return repo.findMany({ productTypeId, carrierTypeId, search });
+exports.list = async (filters = {}) => {
+  return repo.findMany(filters);
 };
 
 exports.getById = async (id) => {
@@ -53,7 +53,10 @@ exports.create = async (payload = {}) => {
     carrier_density,     // numeric
     supplier_product_code,
     bimeks_product_name,
-    length_unit,         // 👈 stok uzunluk birimi: "m" | "um"
+
+    // 🔹 Yeni alanlar:
+    stock_unit,          // "area" | "weight"
+    thickness_unit,      // "m" | "um"
   } = payload || {};
 
   // ---- Zorunlu alan kontrolleri ----
@@ -82,17 +85,32 @@ exports.create = async (payload = {}) => {
     throw e;
   }
 
-  // ---- Stok uzunluk birimi ("m" veya "um") ----
-  let finalLengthUnit = (length_unit || "").toLowerCase();
-  if (finalLengthUnit !== "m" && finalLengthUnit !== "um") {
-    finalLengthUnit = "m"; // varsayılan: metre
+  // ---- Stok birimi ("area" veya "weight") ----
+  const allowedStockUnits = ["area", "weight", "length", "unit"];
+
+  let finalStockUnit = (stock_unit || "").toLowerCase();
+
+  if (!allowedStockUnits.includes(finalStockUnit)) {
+    const e = new Error("STOCK_UNIT_REQUIRED");
+    e.status = 400;
+    e.message =
+      "Geçerli bir stok birimi seçilmelidir (alan / ağırlık / uzunluk / adet).";
+    throw e;
+  }
+
+  // ---- Kalınlık birimi ("m" veya "um") ----
+  let finalThicknessUnit = (thickness_unit || "").toLowerCase();
+  if (finalThicknessUnit !== "m" && finalThicknessUnit !== "um") {
+    // İstersen burada hata da fırlatabiliriz;
+    // şimdilik varsayılanı 'um' yapıyorum:
+    finalThicknessUnit = "um";
   }
 
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
 
-    // 1) Display code'ları çek (name değil display_code kullanıyoruz)
+    // 1) Display code'ları çek
     const supplierCode     = await getDisplayCode(client, "suppliers",      supplier_id,      0, "00");
     const productTypeCode  = await getDisplayCode(client, "product_types",  product_type_id,  0, "0");
     const carrierTypeCode  = await getDisplayCode(client, "carrier_types",  carrier_type_id,  0, "0");
@@ -102,11 +120,10 @@ exports.create = async (payload = {}) => {
     const adhesiveTypeCode = await getDisplayCode(client, "adhesive_types", adhesive_type_id, 0, "0");
 
     // 2) Kalınlık ve yoğunluk kodları
-    const thicknessCode = numericToCode(thickness, 4);      // örn: 50  -> "050"
-    const densityCode   = numericToCode(carrier_density, 3);// örn: 120 -> "120"
+    const thicknessCode = numericToCode(thickness, 4);
+    const densityCode   = numericToCode(carrier_density, 3);
 
-    // 3) Bimeks kodu: tedarikçi & product_type & carrier_type & carrier_color &
-    //    kalınlık & taşıyıcı yoğunluk & liner_color & liner_type & adhesive_type
+    // 3) Bimeks kodu
     const bimeks_code = [
       supplierCode,
       productTypeCode,
@@ -134,10 +151,11 @@ exports.create = async (payload = {}) => {
         adhesive_type_id,
         bimeks_code,
         bimeks_product_name,
-        length_unit            -- 👈 YENİ
+        stock_unit,
+        thickness_unit
       )
       VALUES (
-        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13
+        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14
       )
       RETURNING
         id,
@@ -153,7 +171,8 @@ exports.create = async (payload = {}) => {
         adhesive_type_id,
         bimeks_code,
         bimeks_product_name,
-        length_unit
+        stock_unit,
+        thickness_unit
     `;
 
     const { rows } = await client.query(insertSql, [
@@ -169,7 +188,8 @@ exports.create = async (payload = {}) => {
       adhesive_type_id || null,
       bimeks_code,
       bimeks_product_name.trim(),
-      finalLengthUnit,
+      finalStockUnit,
+      finalThicknessUnit,
     ]);
 
     await client.query("COMMIT");
@@ -177,7 +197,6 @@ exports.create = async (payload = {}) => {
   } catch (err) {
     await client.query("ROLLBACK");
 
-    // bimeks_code unique ise buraya düşer
     if (err.code === "23505") {
       err.status = 409;
       err.message = "Bu Bimeks kodu ile kayıt zaten mevcut.";

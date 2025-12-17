@@ -2,22 +2,41 @@
 const service = require("./masters.service");
 
 // GET /components
+// src/modules/masters/masters.controller.js
 exports.list = async (req, res) => {
   try {
     const productTypeId = Number(req.query.productTypeId || 0);
     const carrierTypeId = Number(req.query.carrierTypeId || 0);
+    const supplierId    = Number(req.query.supplierId || 0);
     const search        = (req.query.search || "").trim();
 
-    const rows = await service.list({ productTypeId, carrierTypeId, search });
+    // ✅ yeni filtreler (tanım listesi hesaplamasını etkileyecek)
+    const statusId   = req.query.statusId ? Number(req.query.statusId) : null;
+    const warehouseId= req.query.warehouseId ? Number(req.query.warehouseId) : null;
+    const locationId = req.query.locationId ? Number(req.query.locationId) : null;
+
+    // istersen FE "Depoda" seçmeden de sadece depodakileri görmek için
+    const inStockOnly = String(req.query.inStockOnly || "") === "true";
+
+    const rows = await service.list({
+      productTypeId,
+      carrierTypeId,
+      supplierId,
+      search,
+      statusId,
+      warehouseId,
+      locationId,
+      inStockOnly,
+    });
+
     res.json(rows);
   } catch (err) {
     console.error("masters list error MESSAGE:", err.message);
     console.error("masters list error DETAIL:", err);
-    return res
-      .status(500)
-      .json({ message: err.message || "Internal error" });
+    return res.status(500).json({ message: err.message || "Internal error" });
   }
 };
+
 
 
 exports.create = async (req, res) => {

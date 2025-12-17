@@ -123,7 +123,7 @@ exports.findComponentsOfProduct = async (productId) => {
       pc.consume_qty,
       mm.id            AS comp_master_id,
       mm.bimeks_product_name AS comp_master_name,
-      mm.length_unit   AS comp_length_unit
+      mm.stock_unit   AS comp_stock_unit
     FROM product_components pc
     JOIN components c ON c.id = pc.component_id
     JOIN masters   mm ON mm.id = c.master_id
