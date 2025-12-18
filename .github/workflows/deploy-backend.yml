@@ -2,7 +2,7 @@ name: Deploy Backend to EC2
 
 on:
   push:
-    branches: [ main ]   # ana branch'in ismi farklıysa burada da onu yaz (ör: master)
+    branches: [ bimeks ]   # ana branch'in ismi farklıysa burada da onu yaz (ör: master)
 
 jobs:
   deploy:
