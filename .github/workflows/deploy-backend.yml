@@ -1,19 +1,30 @@
-name: Deploy Backend to EC2
+name: Deploy Backend
 
 on:
   push:
-    branches: [ main ]   # ana branch'in ismi farklıysa burada da onu yaz (ör: master)
+    branches: [ main, bimeks ]
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
 
     steps:
-      - name: SSH deploy backend
+      - name: Deploy DEMO backend (main)
+        if: github.ref == 'refs/heads/main'
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.DEMO_SSH_HOST }}
+          username: ${{ secrets.DEMO_SSH_USER }}
+          key: ${{ secrets.DEMO_SSH_KEY }}
+          script: |
+            sudo /usr/local/bin/deploy-depo-backend.sh
+
+      - name: Deploy BIMEKS backend (bimeks)
+        if: github.ref == 'refs/heads/bimeks'
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_KEY }}
           script: |
-            /usr/local/bin/deploy-depo-backend.sh
+            sudo /usr/local/bin/deploy-depo-backend.sh
