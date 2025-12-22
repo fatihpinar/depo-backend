@@ -1,139 +1,215 @@
 // src/modules/components/components.repository.js
 const pool = require("../../core/db/index");
 
-exports.findMany = async (filters = {}) => {
-  const {
-    search = "",
-    warehouseId = 0,
-    locationId = 0,
-    masterId = 0,
-    availableOnly = false,
-  } = filters;
+ //API shape mapper
+function mapRowToApi(r) {
+  return {
+    id: r.id,
+    barcode: r.barcode,
 
-  let sql = `
+    width: r.width ?? null,
+    height: r.height ?? null,
+    area: r.area ?? null,
+    weight: r.weight ?? null,
+    length: r.length ?? null,
+
+    invoice_no: r.invoice_no ?? null,
+
+    created_at: r.created_at,
+    updated_at: r.updated_at,
+    approved_at: r.approved_at,
+
+    created_by: r.created_by,
+    approved_by: r.approved_by,
+
+    created_by_user: r.created_by
+      ? {
+          id: r.created_by,
+          full_name: r.created_by_full_name || null,
+          username: r.created_by_username || null,
+        }
+      : null,
+
+    approved_by_user: r.approved_by
+      ? {
+          id: r.approved_by,
+          full_name: r.approved_by_full_name || null,
+          username: r.approved_by_username || null,
+        }
+      : null,
+
+    notes: r.notes,
+    status_id: r.status_id,
+    status: r.status_label || r.status_code,
+
+    warehouse: r.warehouse_id ? { id: r.warehouse_id, name: r.warehouse_name } : null,
+    location: r.location_id ? { id: r.location_id, name: r.location_name } : null,
+
+    master: r.master_id
+      ? {
+          id: r.master_id,
+          display_label: r.master_display_label || null,
+          category: r.master_category_id ? { id: r.master_category_id, name: r.master_category_name || null } : null,
+          type: r.master_type_id ? { id: r.master_type_id, name: r.master_type_name || null } : null,
+          supplier: r.master_supplier_id ? { id: r.master_supplier_id, name: r.master_supplier_name || null } : null,
+          stock_unit: r.master_stock_unit_id
+            ? { id: r.master_stock_unit_id, code: r.master_stock_unit_code || null, label: r.master_stock_unit_label || null }
+            : null,
+        }
+      : null,
+  };
+}
+
+/**
+ * Tek kaynak SELECT + JOIN bloğu
+ * - findMany / findById aynı çekirdeği kullanır
+ */
+function baseSelectSql() {
+  return `
     SELECT
-      se.id, se.barcode,
-      se.width, se.height, se.area,
-      se.weight, se.length,
-      se.invoice_no, se.created_at, se.created_by, se.approved_by,
-      se.updated_at, se.approved_at, se.notes,
+      c.id,
+      c.barcode,
+      c.width,
+      c.height,
+      c.area,
+      c.weight,
+      c.length,
+      c.invoice_no,
+      c.created_at,
+      c.created_by,
+      c.approved_by,
+      c.updated_at,
+      c.approved_at,
+      c.notes,
+      c.warehouse_id,
+      c.location_id,
+      c.master_id,
+      c.status_id,
 
       cu.username AS created_by_username,
       cu.full_name AS created_by_full_name,
       au.username AS approved_by_username,
       au.full_name AS approved_by_full_name,
 
-      w.id AS warehouse_id, w.name AS warehouse_name,
-      l.id AS location_id, l.name AS location_name,
+      w.name AS warehouse_name,
+      l.name AS location_name,
 
-      pm.id                AS master_id,
-      pm.bimeks_product_name AS master_bimeks_product_name,   -- 🔧
-      pm.bimeks_code AS master_bimeks_code,
-      pm.stock_unit     AS master_stock_unit,
-      pm.thickness_unit AS master_thickness_unit,
-
-
-      st.id AS status_id,
       st.code AS status_code,
       st.label AS status_label,
 
-      t.name AS type_name,
-      s.name AS supplier_name
-    FROM components se
-    LEFT JOIN warehouses w      ON w.id = se.warehouse_id
-    LEFT JOIN locations  l      ON l.id = se.location_id
-    JOIN masters pm             ON pm.id = se.master_id
-    LEFT JOIN product_types t   ON t.id = pm.product_type_id
-    LEFT JOIN suppliers s       ON s.id = pm.supplier_id
-    JOIN statuses st            ON st.id = se.status_id
-    LEFT JOIN users cu          ON cu.id = se.created_by
-    LEFT JOIN users au          ON au.id = se.approved_by
+      m.display_label AS master_display_label,
+      m.category_id   AS master_category_id,
+      m.type_id       AS master_type_id,
+      m.supplier_id   AS master_supplier_id,
+      m.stock_unit_id AS master_stock_unit_id,
+
+      cat.name AS master_category_name,
+      typ.name AS master_type_name,
+      sup.name AS master_supplier_name,
+
+      su.code  AS master_stock_unit_code,
+      su.label AS master_stock_unit_label
+
+    FROM components c
+    LEFT JOIN warehouses w ON w.id = c.warehouse_id
+    LEFT JOIN locations  l ON l.id = c.location_id
+
+    JOIN masters m ON m.id = c.master_id
+    LEFT JOIN categories cat ON cat.id = m.category_id
+    LEFT JOIN types typ      ON typ.id = m.type_id
+    LEFT JOIN suppliers sup  ON sup.id = m.supplier_id
+    LEFT JOIN stock_units su ON su.id = m.stock_unit_id
+
+    JOIN statuses st ON st.id = c.status_id
+
+    LEFT JOIN users cu ON cu.id = c.created_by
+    LEFT JOIN users au ON au.id = c.approved_by
   `;
+}
+
+/**
+ * Filtre builder (findMany için)
+ * - Tek yerden param yönetimi
+ */
+function buildWhere(filters = {}) {
+  const {
+    search = "",
+    warehouseId,
+    locationId,
+    masterId,
+    statusId,
+    availableOnly = false,
+  } = filters;
 
   const where = [];
   const params = [];
+  const push = (v) => {
+    params.push(v);
+    return `$${params.length}`;
+  };
 
-  if (availableOnly) where.push(`se.status_id = 1`);
-  if (warehouseId > 0) {
-    params.push(warehouseId);
-    where.push(`se.warehouse_id = $${params.length}`);
+  if (availableOnly) where.push(`c.status_id = 1`);
+
+  if (warehouseId && Number(warehouseId) > 0) {
+    where.push(`c.warehouse_id = ${push(Number(warehouseId))}`);
   }
-  if (locationId > 0) {
-    params.push(locationId);
-    where.push(`se.location_id = $${params.length}`);
+  if (locationId && Number(locationId) > 0) {
+    where.push(`c.location_id = ${push(Number(locationId))}`);
   }
-  if (masterId > 0) {
-    params.push(masterId);
-    where.push(`se.master_id = $${params.length}`);
+  if (masterId && Number(masterId) > 0) {
+    where.push(`c.master_id = ${push(Number(masterId))}`);
   }
-
-  if (filters.statusId) {
-    where.push(`se.status_id = $${params.length + 1}`);
-    params.push(filters.statusId);
+  if (statusId && Number(statusId) > 0) {
+    where.push(`c.status_id = ${push(Number(statusId))}`);
   }
 
-  if (search) {
-    const term = `%${search}%`;
-    params.push(term);
-    const p1 = params.length;
-
-    params.push(term);
-    const p2 = params.length;
-
+  const term = String(search || "").trim();
+  if (term) {
+    const like = `%${term}%`;
+    const p = push(like);
     where.push(`(
-      se.barcode ILIKE $${p1}
-      OR t.name ILIKE $${p2}
-      OR s.name ILIKE $${p2}
-      OR pm.bimeks_product_name ILIKE $${p2}
-      OR pm.bimeks_code ILIKE $${p2}          -- ✅ EKLE
-      OR se.invoice_no ILIKE $${p2}
+      c.barcode ILIKE ${p}
+      OR c.invoice_no ILIKE ${p}
+      OR m.display_label ILIKE ${p}
+      OR cat.name ILIKE ${p}
+      OR typ.name ILIKE ${p}
+      OR sup.name ILIKE ${p}
     )`);
   }
 
+  return { where, params };
+}
 
+/**
+ * LIST
+ */
+exports.findMany = async (filters = {}) => {
+  const { where, params } = buildWhere(filters);
+
+  let sql = baseSelectSql();
   if (where.length) sql += ` WHERE ${where.join(" AND ")}`;
-  sql += ` ORDER BY se.id DESC`;
+  sql += ` ORDER BY c.id DESC`;
 
   const { rows } = await pool.query(sql, params);
-  return rows;
+  return rows.map(mapRowToApi);
 };
 
+/**
+ * GET BY ID
+ */
 exports.findById = async (id) => {
   const sql = `
-    SELECT
-      se.*,
-
-      cu.username AS created_by_username,
-      cu.full_name AS created_by_full_name,
-      au.username AS approved_by_username,
-      au.full_name AS approved_by_full_name,
-
-      w.id AS warehouse_id, w.name AS warehouse_name,
-      l.id AS location_id, l.name AS location_name,
-
-      pm.id                  AS master_id,
-      pm.bimeks_code AS master_bimeks_code,   -- 🔧
-      pm.bimeks_code         AS master_code,
-      pm.stock_unit          AS master_stock_unit,
-      pm.thickness_unit      AS master_thickness_unit,
-      
-      st.id AS status_id,
-      st.code AS status_code,
-      st.label AS status_label
-    FROM components se
-    LEFT JOIN warehouses w ON w.id = se.warehouse_id
-    LEFT JOIN locations  l ON l.id = se.location_id
-    JOIN masters pm        ON pm.id = se.master_id
-    JOIN statuses st       ON st.id = se.status_id
-    LEFT JOIN users cu     ON cu.id = se.created_by
-    LEFT JOIN users au     ON au.id = se.approved_by
-    WHERE se.id = $1
+    ${baseSelectSql()}
+    WHERE c.id = $1
     LIMIT 1
   `;
-  const { rows } = await pool.query(sql, [id]);
-  return rows[0] || null;
+  const { rows } = await pool.query(sql, [Number(id)]);
+  return rows[0] ? mapRowToApi(rows[0]) : null;
 };
 
+/**
+ * LOCK (update/exit işlemleri için minimal alan seti)
+ */
 exports.lockById = async (client, id) => {
   const { rows } = await client.query(
     `SELECT
@@ -153,14 +229,18 @@ exports.lockById = async (client, id) => {
      FROM components
      WHERE id=$1
      FOR UPDATE`,
-    [id]
+    [Number(id)]
   );
   return rows[0] || null;
 };
 
+/**
+ * UPDATE FIELDS (transaction içinde)
+ * - Dikkat: RETURNING minimal dönüyor; Service sonunda repo.findById ile full+map'li döndür.
+ */
 exports.updateFields = async (client, id, fields) => {
-  const cols = Object.keys(fields);
-  if (!cols.length) return exports.findById(id);
+  const cols = Object.keys(fields || {});
+  if (!cols.length) return null;
 
   const sets = [];
   const params = [];
@@ -176,28 +256,16 @@ exports.updateFields = async (client, id, fields) => {
 
   sets.push(`updated_at=NOW()`);
 
-  params.push(id);
+  params.push(Number(id));
   const { rows } = await client.query(
     `UPDATE components
         SET ${sets.join(", ")}
       WHERE id=$${params.length}
-      RETURNING
-        id,
-        barcode,
-        master_id,
-        status_id,
-        warehouse_id,
-        location_id,
-        notes,
-        invoice_no,
-        width,
-        height,
-        area,
-        weight,
-        length`,
+      RETURNING id`,
     params
   );
-  return rows[0];
+
+  return rows[0] || null;
 };
 
 exports.insertMany = async (client, entries) => {
@@ -226,11 +294,11 @@ exports.insertMany = async (client, entries) => {
     );
 
     params.push(
-      e.master_id,
-      e.barcode,
-      e.status_id,
-      e.warehouse_id,
-      e.location_id,
+      Number(e.master_id),
+      e.barcode || null,
+      Number(e.status_id),
+      Number(e.warehouse_id),
+      Number(e.location_id),
       e.width ?? null,
       e.height ?? null,
       e.area ?? null,
@@ -241,18 +309,37 @@ exports.insertMany = async (client, entries) => {
     );
   });
 
-  const sql = `INSERT INTO components (${cols.join(",")})
-               VALUES ${placeholders.join(",")}
-               RETURNING *;`;
+  const sql = `
+    INSERT INTO components (${cols.join(",")})
+    VALUES ${placeholders.join(",")}
+    RETURNING id;
+  `;
+
   const { rows } = await client.query(sql, params);
-  return rows;
+  // sadece id döndürüyoruz; full view için service -> findByIds yapacağız
+  return rows.map((r) => Number(r.id));
+};
+
+exports.findManyByIds = async (ids = []) => {
+  const clean = [...new Set(ids.map(Number).filter((x) => Number.isFinite(x) && x > 0))];
+  if (!clean.length) return [];
+
+  const sql = `
+    ${baseSelectSql()}
+    WHERE c.id = ANY($1::int[])
+    ORDER BY c.id DESC
+  `;
+
+  const { rows } = await pool.query(sql, [clean]);
+  return rows.map(mapRowToApi);
 };
 
 exports.barcodesExist = async (client, barcodes) => {
-  if (!barcodes.length) return [];
+  const arr = (barcodes || []).map((x) => String(x || "").trim()).filter(Boolean);
+  if (!arr.length) return [];
   const { rows } = await client.query(
     `SELECT barcode FROM components WHERE barcode = ANY($1)`,
-    [barcodes]
+    [arr]
   );
   return rows;
 };

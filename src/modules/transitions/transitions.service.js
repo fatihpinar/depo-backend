@@ -2,13 +2,12 @@
 const pool = require("../../core/db/index");
 const { randomUUID } = require("crypto");
 const { ITEM_TYPE, ACTION } = require("./transitions.constants");
-const stockRepo = require("../stock-balances/stockBalances.repository");
 
 /**
  * @typedef {Object} TransitionRecord
  * @property {"component"|"product"} item_type
  * @property {number} item_id
- * @property {keyof typeof ACTION} action
+ * @property {string} action
  * @property {number} [qty_delta=0]
  * @property {string} unit
  * @property {number|null} [from_status_id]
@@ -25,9 +24,14 @@ const stockRepo = require("../stock-balances/stockBalances.repository");
 
 function validateRecord(r) {
   if (!r || typeof r !== "object") return "record is empty";
-  if (!r.item_type || ![ITEM_TYPE.COMPONENT, ITEM_TYPE.PRODUCT].includes(r.item_type)) return "invalid item_type";
+  if (
+    !r.item_type ||
+    ![ITEM_TYPE.COMPONENT, ITEM_TYPE.PRODUCT].includes(r.item_type)
+  )
+    return "invalid item_type";
   if (!r.item_id || Number.isNaN(Number(r.item_id))) return "invalid item_id";
-  if (!r.action || !Object.values(ACTION).includes(r.action)) return "invalid action";
+  if (!r.action || !Object.values(ACTION).includes(r.action))
+    return "invalid action";
   if (!r.unit || typeof r.unit !== "string") return "unit is required";
   return null;
 }
@@ -58,14 +62,28 @@ async function recordTransitions(client, batchId, records, optsOrActor = null) {
     actorId = optsOrActor;
   } else if (optsOrActor && typeof optsOrActor === "object") {
     actorId = optsOrActor.actorId ?? null;
-    if (typeof optsOrActor.enrichMeta === "boolean") enrichMeta = optsOrActor.enrichMeta;
+    if (typeof optsOrActor.enrichMeta === "boolean")
+      enrichMeta = optsOrActor.enrichMeta;
   }
 
   const cols = [
-    "batch_id","item_type","item_id","action","qty_delta","unit",
-    "from_status_id","to_status_id",
-    "from_warehouse_id","from_location_id","to_warehouse_id","to_location_id",
-    "context_type","context_id","actor_user_id","notes","meta",
+    "batch_id",
+    "item_type",
+    "item_id",
+    "action",
+    "qty_delta",
+    "unit",
+    "from_status_id",
+    "to_status_id",
+    "from_warehouse_id",
+    "from_location_id",
+    "to_warehouse_id",
+    "to_location_id",
+    "context_type",
+    "context_id",
+    "actor_user_id",
+    "notes",
+    "meta",
   ];
 
   const values = [];
@@ -127,7 +145,8 @@ async function recordTransitions(client, batchId, records, optsOrActor = null) {
 }
 
 async function listTransitions({ itemType, itemId, limit = 50, cursorId = null }) {
-  if (!itemType || !itemId) throw new Error("listTransitions: itemType & itemId required");
+  if (!itemType || !itemId)
+    throw new Error("listTransitions: itemType & itemId required");
 
   const params = [itemType, Number(itemId)];
   let sql = `
@@ -152,6 +171,10 @@ async function listTransitions({ itemType, itemId, limit = 50, cursorId = null }
   return rows;
 }
 
+/**
+ * UI timeline için pagination'lı listeleme.
+ * Not: Product artık kullanılmayacaksa joinsiz/temiz bir sorgu.
+ */
 async function list({
   item_type,
   item_id,
@@ -191,13 +214,6 @@ async function list({
     LEFT JOIN warehouses tw ON tw.id = t.to_warehouse_id
     LEFT JOIN locations  fl ON fl.id = t.from_location_id
     LEFT JOIN locations  tl ON tl.id = t.to_location_id
-
-    LEFT JOIN components c ON (t.item_type = 'component' AND c.id = t.item_id)
-    LEFT JOIN products   p ON (t.item_type = 'product'   AND p.id = t.item_id)
-
-    LEFT JOIN warehouses cw ON cw.id = COALESCE(t.to_warehouse_id, t.from_warehouse_id, c.warehouse_id, p.warehouse_id)
-    LEFT JOIN locations  cl ON cl.id = COALESCE(t.to_location_id,  t.from_location_id,  c.location_id,  p.location_id)
-
     WHERE ${where.join(" AND ")}
   `;
 
@@ -218,10 +234,7 @@ async function list({
       fw.name  AS from_warehouse_name,
       tw.name  AS to_warehouse_name,
       fl.name  AS from_location_name,
-      tl.name  AS to_location_name,
-
-      cw.name  AS current_warehouse_name,
-      cl.name  AS current_location_name
+      tl.name  AS to_location_name
     ${baseSql}
     ORDER BY t.created_at DESC, t.id DESC
     LIMIT $${params.length + 1} OFFSET $${params.length + 2}
@@ -242,164 +255,6 @@ async function list({
   };
 }
 
-/**
- * Component transition kayıtlarına göre stock_balances tablosunu günceller.
- *
- * - Stok bakiyesi master bazlı tutulur (master_id + depo + lokasyon + statü).
- * - Aynı master/depo/lokasyon/statü kombinasyonuna ait tüm deltalar JS tarafında gruplanır.
- * - Sonra tek bir INSERT ... ON CONFLICT ON CONSTRAINT ux_stock_balances_combo ile upsert edilir.
- *
- * Beklenen meta alanları:
- *  - CREATE: meta.area (m²), component → master_id components tablosundan alınır
- *  - CONSUME (sale): meta.consumed_area, meta.fully_consumed
- *  - MOVE (stock):  meta.consumed_area (taşınan alan)
- */
-async function applyStockBalancesForComponentTransitions(client, transitions) {
-  if (!Array.isArray(transitions) || transitions.length === 0) return;
-
-  // 1) Sadece component olanları al
-  const compTransitions = transitions.filter(
-    (t) => t.item_type === ITEM_TYPE.COMPONENT
-  );
-  if (!compTransitions.length) return;
-
-  // 2) Tekil component id listesi
-  const compIds = [
-    ...new Set(
-      compTransitions
-        .map((t) => Number(t.item_id || 0))
-        .filter((id) => Number.isFinite(id) && id > 0)
-    ),
-  ];
-  if (!compIds.length) return;
-
-  const db = client || (await pool.connect());
-  const shouldRelease = !client;
-
-  try {
-    // 3) Component → master_id map
-    const { rows: comps } = await db.query(
-      `SELECT id, master_id FROM components WHERE id = ANY($1::int[])`,
-      [compIds]
-    );
-
-    const masterByComponent = new Map();
-    for (const c of comps) {
-      masterByComponent.set(Number(c.id), Number(c.master_id));
-    }
-
-    // 4) Aynı kombinasyonları tek satırda toplayacağımız aggregate map
-    // key: masterId|statusId|whId|locId|unit
-    const aggregates = new Map();
-
-    const toNum = (v) => {
-      const n = Number(v);
-      return Number.isFinite(n) ? n : null;
-    };
-
-    for (const t of compTransitions) {
-      const compId = Number(t.item_id || 0);
-      const masterId = masterByComponent.get(compId);
-      if (!compId || !masterId) continue; // master'ı belli olmayanları atla
-
-      const statusId = Number(t.to_status_id || t.from_status_id || 0);
-      const whId = Number(t.to_warehouse_id || t.from_warehouse_id || 0);
-      const locId = Number(t.to_location_id || t.from_location_id || 0);
-      const unit = t.unit || "EA";
-
-      if (!statusId || !whId || !locId) {
-        // eksik bilgi varsa stok bakiyesi güncellemeyelim
-        continue;
-      }
-
-      // quantity değişimi (CREATE → +1 EA, CONSUME → -m², vs.)
-      const qtyDelta = Number(t.qty_delta || 0);
-
-      // area değişimi:
-      //  - CREATE meta.area → +area
-      //  - CONSUME meta.consumed_area → -consumed_area
-      let areaDelta = 0;
-      const meta = t.meta || {};
-
-      const consumed = toNum(meta.consumed_area);
-      const area = toNum(meta.area);
-
-      if (consumed !== null) {
-        areaDelta -= consumed;
-      } else if (area !== null) {
-        areaDelta += area;
-      }
-
-      if (qtyDelta === 0 && areaDelta === 0) continue;
-
-      const key = `${masterId}|${statusId}|${whId}|${locId}|${unit}`;
-
-      let agg = aggregates.get(key);
-      if (!agg) {
-        agg = {
-          masterId,
-          statusId,
-          whId,
-          locId,
-          unit,
-          qtyDelta: 0,
-          areaDelta: 0,
-        };
-        aggregates.set(key, agg);
-      }
-
-      agg.qtyDelta += qtyDelta;
-      agg.areaDelta += areaDelta;
-    }
-
-    if (!aggregates.size) return;
-
-    // 5) Toplanmış verileri tek INSERT ... ON CONFLICT ile bas
-    const values = [];
-    const placeholders = [];
-
-    for (const agg of aggregates.values()) {
-      const base = values.length;
-      placeholders.push(
-        `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6}, $${base + 7})`
-      );
-
-      values.push(
-        agg.masterId,   // master_id
-        agg.warehouseId ?? agg.whId, // eski isim ihtimali için (güvenlik)
-        agg.locId ?? agg.locationId ?? agg.locId,
-        agg.statusId,
-        agg.unit,
-        agg.qtyDelta,
-        agg.areaDelta
-      );
-    }
-
-    const sql = `
-      INSERT INTO stock_balances (
-        master_id,
-        warehouse_id,
-        location_id,
-        status_id,
-        unit,
-        quantity,
-        area_sum
-      )
-      VALUES
-        ${placeholders.join(", ")}
-      ON CONFLICT (master_id, warehouse_id, location_id, status_id, unit)
-      DO UPDATE SET
-        quantity = stock_balances.quantity + EXCLUDED.quantity,
-        area_sum = stock_balances.area_sum + EXCLUDED.area_sum;
-    `;
-
-    await db.query(sql, values);
-  } finally {
-    if (shouldRelease) db.release();
-  }
-}
-
-
 module.exports = {
   makeBatchId,
   recordTransitions,
@@ -407,8 +262,4 @@ module.exports = {
   list,
   ITEM_TYPE,
   ACTION,
-  applyStockBalancesForComponentTransitions,
 };
-
-
-

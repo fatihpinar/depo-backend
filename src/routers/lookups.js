@@ -1,35 +1,22 @@
+// src/routes/lookups.js
 const express = require("express");
 const router = express.Router();
 
-// İSİM ÖNEMLİ: lookups diye import et
 const lookups = require("../controllers/lookupsController");
 
-// Eski endpointler (hala çalışsın diye)
+// master form için temel lookups
 router.get("/categories", lookups.getCategories);
-router.get("/types/:categoryId", lookups.getTypesByCategory);
+router.post("/categories", lookups.createCategory); // ✅ EKLE
 
-// Yeni, daha net endpointler
-router.get("/product-types", lookups.getProductTypes);
-router.get("/carrier-types", lookups.getCarrierTypes);
-router.get("/carrier-colors", lookups.getCarrierColors);
-router.get("/liner-colors", lookups.getLinerColors);
-router.get("/liner-types", lookups.getLinerTypes);
-router.get("/adhesive-types", lookups.getAdhesiveTypes);
+router.get("/types/:categoryId", lookups.getTypesByCategory);
+router.post("/types", lookups.createType); // ✅ EKLE
 
 router.get("/suppliers", lookups.getSuppliers);
+router.post("/suppliers", lookups.createSupplier);
+
 router.get("/warehouses", lookups.getWarehouses);
 router.get("/locations", lookups.getLocations);
 router.get("/statuses", lookups.statuses);
-
-router.post("/suppliers",      lookups.createSupplier);
-router.post("/carrier-types",  lookups.createCarrierType);
-router.post("/carrier-colors", lookups.createCarrierColor);
-router.post("/liner-colors",   lookups.createLinerColor);
-router.post("/liner-types",    lookups.createLinerType);
-router.post("/adhesive-types", lookups.createAdhesiveType);
-
-
-// legacy (master schema)
-router.get("/master-field-schema", lookups.getMasterFieldSchema);
+router.get("/stock-units", lookups.getStockUnits);
 
 module.exports = router;

@@ -2,7 +2,6 @@ const express = require("express");
 const router = express.Router();
 
 const { middleware } = require("../modules/auth");
-const stockCtrl = require("../modules/stock-balances/stockBalances.controller");
 
 // Public
 router.use("/auth", require("../modules/auth").router);
@@ -15,7 +14,6 @@ router.use("/masters", require("../modules/masters/masters.routes"));
 router.use("/components", require("../modules/components/components.routes"));
 router.use("/products/recipes", require("../modules/products/recipes/recipes.routes"));
 router.use("/products", require("../modules/products/products.routes"));
-router.use("/inventory", require("./inventory"));
 router.use("/inventory-transitions", require("../modules/transitions").router);
 router.use("/approvals", require("../modules/approvals/approvals.routes"));
 

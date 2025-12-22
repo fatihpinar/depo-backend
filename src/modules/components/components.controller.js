@@ -1,3 +1,4 @@
+// src/modules/components/components.controller.js
 const service = require("./components.service");
 
 function getActorId(req) {
@@ -5,8 +6,6 @@ function getActorId(req) {
 }
 
 // GET /components
-// src/modules/components/components.controller.js
-
 exports.list = async (req, res, next) => {
   try {
     const {

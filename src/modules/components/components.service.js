@@ -1,8 +1,7 @@
 // src/modules/components/components.service.js
 const pool = require("../../core/db/index");
 const repo = require("./components.repository");
-const { mapRowToApi } = require("./components.mappers");
-const { recordTransitions, makeBatchId, applyStockBalancesForComponentTransitions } =
+const { recordTransitions, makeBatchId } =
   require("../transitions/transitions.service");
 
 
@@ -26,23 +25,10 @@ const STATUS = {
 };
 
 /* =============== LIST / GET =============== */
-
-exports.list = async (filters) => {
-  const rows = await repo.findMany(filters);
-  return rows.map(mapRowToApi);             // 👈 fonksiyon artık garanti var
-};
-
-exports.getById = async (id) => {
-  const r = await repo.findById(id);
-  return r ? mapRowToApi(r) : null;
-};
+exports.list = async (filters) => repo.findMany(filters);
+exports.getById = async (id) => repo.findById(id);
 
 /* =============== UPDATE =============== */
-
-// src/modules/components/components.service.js
-
-// src/modules/components/components.service.js
-
 exports.update = async (id, payload = {}, actorId = null) => {
   const client = await pool.connect();
   try {
@@ -60,10 +46,19 @@ exports.update = async (id, payload = {}, actorId = null) => {
       payload.master_id !== undefined ? Number(payload.master_id) : Number(before.master_id);
 
     const { rows: ms } = await client.query(
-      `SELECT id, stock_unit FROM masters WHERE id = $1`,
+      `
+      SELECT m.id, su.code AS stock_unit_code
+      FROM masters m
+      LEFT JOIN stock_units su ON su.id = m.stock_unit_id
+      WHERE m.id = $1
+      `,
       [nextMasterId]
     );
-    const stockUnit = (ms[0]?.stock_unit || "").toString().trim().toLowerCase();
+
+    // masters.stock_unit_id boşsa (ya da stock_units kaydı yoksa) boş gelir.
+    // İstersen default'u "unit" yapabilirsin:
+    const stockUnit = (ms[0]?.stock_unit_code || "").toString().trim().toLowerCase();
+
 
     // Barkod zorunluluğu (senin kuralın)
     if (payload.status_id !== undefined && Number(payload.status_id) === STATUS.in_stock) {
@@ -195,10 +190,6 @@ exports.update = async (id, payload = {}, actorId = null) => {
   }
 };
 
-
-
-
-
 /* =============== BULK CREATE =============== */
 
 exports.bulkCreate = async (entries, { actorId } = {}) => {
@@ -208,11 +199,17 @@ exports.bulkCreate = async (entries, { actorId } = {}) => {
 
     const masterIds = [...new Set(entries.map(e => Number(e.master_id)).filter(Boolean))];
     const { rows: ms } = await client.query(
-      `SELECT id, stock_unit FROM masters WHERE id = ANY($1)`,
+      `
+      SELECT m.id, su.code AS stock_unit_code
+      FROM masters m
+      LEFT JOIN stock_units su ON su.id = m.stock_unit_id
+      WHERE m.id = ANY($1::int[])
+      `,
       [masterIds]
     );
+
     const masterUnitById = new Map(
-      ms.map(x => [Number(x.id), (x.stock_unit || "").toString().trim().toLowerCase()])
+      ms.map(x => [Number(x.id), (x.stock_unit_code || "").toString().trim().toLowerCase()])
     );
 
     const numOrNull = (v) => (v === undefined || v === null || v === "" ? null : Number(v));
@@ -337,7 +334,6 @@ exports.bulkCreate = async (entries, { actorId } = {}) => {
     }));
 
     await recordTransitions(client, batchId, recs, { actorId });
-    await applyStockBalancesForComponentTransitions(client, recs);
 
     await client.query("COMMIT");
     return rows.map(mapRowToApi);
@@ -350,9 +346,7 @@ exports.bulkCreate = async (entries, { actorId } = {}) => {
   }
 };
 
-
 // src/modules/components/components.service.js
-
 exports.exitMany = async (payload, actorId = null) => {
   // 🔹 1) Payload'ı normalize et
   let rows;
@@ -450,8 +444,8 @@ exports.exitMany = async (payload, actorId = null) => {
         transitions.push({
           item_type: ITEM_TYPE.COMPONENT,
           item_id: c.id,
-          action: ACTION.CONSUME,      // tüketim
-          qty_delta: 0,                // 👈 adet değişmiyor
+          action: ACTION.CONSUME,
+          qty_delta: 0,
           unit: UNIT_LABEL,
           from_status_id: c.status_id,
           to_status_id: newStatus,
@@ -463,7 +457,7 @@ exports.exitMany = async (payload, actorId = null) => {
           context_id: null,
           meta: {
             target: "sale",
-            consumed_area: qty,        // 👈 sadece alan azalacak
+            consumed_area: qty,    
             remaining_area: left,
             fully_consumed: fullyConsumed,
           },
@@ -553,7 +547,6 @@ exports.exitMany = async (payload, actorId = null) => {
       if (transitions.length) {
       const batchId = makeBatchId();
       await recordTransitions(client, batchId, transitions, { actorId });
-      await applyStockBalancesForComponentTransitions(client, transitions);
     }
 
     await client.query("COMMIT");
