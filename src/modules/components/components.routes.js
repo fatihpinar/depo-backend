@@ -20,6 +20,17 @@ router.post(
   middleware.requirePermission("inventory.adjust"),
   ctrl.exitMany
 );
+router.get(
+  "/by-barcode",
+  middleware.requirePermission("components.read"),
+  ctrl.getByBarcode
+);
+
+router.get(
+  "/search",
+  middleware.requirePermission("components.read"),
+  ctrl.search
+);
 
 // DETAIL + UPDATE
 router.get("/:id", middleware.requirePermission("components.read"), ctrl.getById);
