@@ -351,13 +351,25 @@ exports.bulkCreate = async (entries, { actorId } = {}) => {
   }
 };
 
+async function assertRecipeExists(client, recipe_id) {
+  if (!recipe_id) return;
+  const { rows } = await client.query(`SELECT id FROM recipes WHERE id=$1 LIMIT 1`, [Number(recipe_id)]);
+  if (!rows.length) {
+    const e = new Error("RECIPE_NOT_FOUND");
+    e.status = 404;
+    e.code = "RECIPE_NOT_FOUND";
+    e.message = `Tarif bulunamadı: ${recipe_id}`;
+    throw e;
+  }
+}
+
 /* =============== EXIT MANY (DÜZELTİLMİŞ) =============== */
 /**
  * İş kuralın:
  * - Eğer UI "Adet" seçiliyse -> component direkt sold olur (tam satış)
  * - Eğer miktar girdiyse (area/weight/length) -> o kadar düş, eşitse sold yap
  */
-exports.exitMany = async (rows, actorId = null) => {
+exports.exitMany = async (rows, actorId = null, { recipe_id = null } = {}) => {
   if (!Array.isArray(rows) || !rows.length) {
     const e = new Error("EMPTY_ROWS");
     e.status = 400;
@@ -369,6 +381,9 @@ exports.exitMany = async (rows, actorId = null) => {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
+
+    // ✅ recipe_id varsa doğrula (opsiyonel ama önerilir)
+    await assertRecipeExists(client, recipe_id);
 
     const transitions = [];
     const UNIT_LABEL = "EA";
@@ -394,32 +409,21 @@ exports.exitMany = async (rows, actorId = null) => {
         throw e;
       }
 
+      // ✅ Bir kez hesapla (senin kodda iki kere hesaplanıyordu)
       const stockUnit = await getMasterStockUnitCode(client, c.master_id);
       const measureField = getMeasureFieldByUnit(stockUnit);
 
       // ============ SALE ============
       if (target === "sale") {
-        // UI'de "Adet" seçilince consume_qty gelmez/boş olur.
         const hasQty =
           raw.consume_qty !== undefined &&
           raw.consume_qty !== null &&
           String(raw.consume_qty).trim() !== "";
 
-        // miktar alanı: area/weight/length için hangisi düşecek?
-        const stockUnit = await getMasterStockUnitCode(client, c.master_id);
-        const measureField =
-          stockUnit === "area" ? "area" :
-          stockUnit === "weight" ? "weight" :
-          stockUnit === "length" ? "length" :
-          null;
-
-        // ========= 1) ADET MODU (FULL SALE) =========
+        // 1) ADET MODU (FULL SALE) — stockUnit ne olursa olsun satılır
         if (!hasQty) {
-          // full sale: status sold
           const update = { status_id: STATUS.sold };
 
-          // Eğer ölçülü ürünse (area/weight/length), eldeki miktarı da 0'layalım ki stok/balance tutarlı kalsın
-          // (özellikle balances transition meta'sı ölçü üzerinden çalışıyorsa kritik)
           let have = null;
           if (measureField) {
             have = Number(c[measureField] || 0);
@@ -428,33 +432,30 @@ exports.exitMany = async (rows, actorId = null) => {
 
           await repo.updateFields(client, c.id, update);
 
-          // transition meta: balances için ölçü bazlı alanları da geç
           const meta = {
             target: "sale",
-            mode: "unit",              // UI seçimi
-            stock_unit: stockUnit,     // ürünün doğal birimi
+            mode: "unit",
+            stock_unit: stockUnit,
             fully_consumed: true,
+            recipe_id: recipe_id ?? null, // ✅ tarife bağla
           };
 
-          if (measureField) {
-            // balances logic'in eski anahtarlarıyla uyumlu kalmak için:
-            if (measureField === "area") {
-              meta.consumed_area = have ?? 0;
-              meta.remaining_area = 0;
-            } else if (measureField === "weight") {
-              meta.consumed_weight = have ?? 0;
-              meta.remaining_weight = 0;
-            } else if (measureField === "length") {
-              meta.consumed_length = have ?? 0;
-              meta.remaining_length = 0;
-            }
+          if (measureField === "area") {
+            meta.consumed_area = have ?? 0;
+            meta.remaining_area = 0;
+          } else if (measureField === "weight") {
+            meta.consumed_weight = have ?? 0;
+            meta.remaining_weight = 0;
+          } else if (measureField === "length") {
+            meta.consumed_length = have ?? 0;
+            meta.remaining_length = 0;
           }
 
           transitions.push({
             item_type: ITEM_TYPE.COMPONENT,
             item_id: c.id,
             action: ACTION.CONSUME,
-            qty_delta: 1,          // "1 adet ürün çıktı" semantiği
+            qty_delta: 1,
             unit: "EA",
             from_status_id: c.status_id,
             to_status_id: STATUS.sold,
@@ -462,16 +463,18 @@ exports.exitMany = async (rows, actorId = null) => {
             from_location_id: c.location_id || null,
             to_warehouse_id: c.warehouse_id || null,
             to_location_id: c.location_id || null,
+
+            // ✅ context alanları: tarife dayalı çıkış izlenebilir olsun
             context_type: "component_exit",
-            context_id: null,
+            context_id: recipe_id ?? null,
+
             meta,
           });
 
           continue;
         }
 
-        // ========= 2) MİKTAR MODU (PARTIAL SALE) =========
-        // Bu mod sadece area/weight/length için anlamlı.
+        // 2) MİKTAR MODU (PARTIAL SALE)
         if (!measureField) {
           const e = new Error("INVALID_ROW");
           e.status = 400;
@@ -511,7 +514,7 @@ exports.exitMany = async (rows, actorId = null) => {
           throw e;
         }
 
-        let left = have - qty;
+        const left = have - qty;
         const fullyConsumed = left <= 0;
 
         const upd = {};
@@ -522,10 +525,11 @@ exports.exitMany = async (rows, actorId = null) => {
 
         const meta = {
           target: "sale",
-          mode: "measure",          // UI seçimi
+          mode: "measure",
           stock_unit: stockUnit,
           measure_field: measureField,
           fully_consumed: fullyConsumed,
+          recipe_id: recipe_id ?? null, // ✅ tarife bağla
         };
 
         if (measureField === "area") {
@@ -543,7 +547,7 @@ exports.exitMany = async (rows, actorId = null) => {
           item_type: ITEM_TYPE.COMPONENT,
           item_id: c.id,
           action: ACTION.CONSUME,
-          qty_delta: 0, // miktarı meta ile izliyoruz
+          qty_delta: 0,
           unit: "EA",
           from_status_id: c.status_id,
           to_status_id: fullyConsumed ? STATUS.sold : c.status_id,
@@ -552,7 +556,7 @@ exports.exitMany = async (rows, actorId = null) => {
           to_warehouse_id: c.warehouse_id || null,
           to_location_id: c.location_id || null,
           context_type: "component_exit",
-          context_id: null,
+          context_id: recipe_id ?? null,
           meta,
         });
 
@@ -560,7 +564,6 @@ exports.exitMany = async (rows, actorId = null) => {
       }
 
       // ============ STOCK TRANSFER ============
-      // depo/lokasyon zorunlu, tüm miktarı taşır (kuralın)
       const whId = requirePositiveInt(raw.warehouse_id, "WAREHOUSE_LOCATION_REQUIRED", "Depo zorunlu.");
       const locId = requirePositiveInt(raw.location_id, "WAREHOUSE_LOCATION_REQUIRED", "Lokasyon zorunlu.");
 
@@ -568,14 +571,9 @@ exports.exitMany = async (rows, actorId = null) => {
       const beforeWh = c.warehouse_id || null;
       const beforeLc = c.location_id || null;
 
-      // taşınan miktar:
-      const movedQty =
-        stockUnit === "unit" ? 1 : Number(c[measureField] || 0);
+      const movedQty = stockUnit === "unit" ? 1 : Number(c[measureField] || 0);
 
-      await repo.updateFields(client, c.id, {
-        warehouse_id: whId,
-        location_id: locId,
-      });
+      await repo.updateFields(client, c.id, { warehouse_id: whId, location_id: locId });
 
       // Eski yerden düş
       transitions.push({
@@ -591,12 +589,13 @@ exports.exitMany = async (rows, actorId = null) => {
         to_warehouse_id: beforeWh,
         to_location_id: beforeLc,
         context_type: "component_exit",
-        context_id: null,
+        context_id: recipe_id ?? null,
         meta: {
           target: "stock",
           stock_unit: stockUnit,
           moved_qty: movedQty,
           move_full: true,
+          recipe_id: recipe_id ?? null,
         },
       });
 
@@ -614,12 +613,13 @@ exports.exitMany = async (rows, actorId = null) => {
         to_warehouse_id: whId,
         to_location_id: locId,
         context_type: "component_exit",
-        context_id: null,
+        context_id: recipe_id ?? null,
         meta: {
           target: "stock",
           stock_unit: stockUnit,
           moved_qty: movedQty,
           move_full: true,
+          recipe_id: recipe_id ?? null,
         },
       });
     }

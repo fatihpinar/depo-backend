@@ -88,17 +88,31 @@ exports.bulkCreate = async (req, res) => {
 
 exports.exitMany = async (req, res) => {
   try {
-    // FE bazen {rows:[...]} bazen direkt [...] gönderebilir:
-    const rows = Array.isArray(req.body) ? req.body : (Array.isArray(req.body?.rows) ? req.body.rows : []);
+    const rows = Array.isArray(req.body)
+      ? req.body
+      : (Array.isArray(req.body?.rows) ? req.body.rows : []);
+
     if (!rows.length) return res.status(400).json({ message: "Boş satır listesi" });
 
-    const actorId = getActorId(req);
-    const result = await service.exitMany(rows, actorId);
+    // ✅ recipe_id (integer) — opsiyonel
+    const recipeIdRaw = Array.isArray(req.body) ? null : req.body?.recipe_id;
+    const recipe_id =
+      recipeIdRaw === null || recipeIdRaw === undefined || recipeIdRaw === "" || recipeIdRaw === "none"
+        ? null
+        : Number(recipeIdRaw);
 
-    return res.json(result); // { processed: N }
+    if (recipe_id !== null && (!Number.isFinite(recipe_id) || recipe_id <= 0)) {
+      return res.status(400).json({ message: "Geçersiz recipe_id" });
+    }
+
+    const actorId = getActorId(req);
+    const result = await service.exitMany(rows, actorId, { recipe_id });
+
+    return res.json(result);
   } catch (err) {
     if (err.status) return res.status(err.status).json({ code: err.code, message: err.message, details: err.details });
     console.error("components exitMany error:", err);
     return res.status(500).json({ message: "Internal error" });
   }
 };
+

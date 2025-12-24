@@ -12,14 +12,15 @@ router.use(middleware.requireAuth);
 router.use("/lookups", require("./lookups"));
 router.use("/masters", require("../modules/masters/masters.routes"));
 router.use("/components", require("../modules/components/components.routes"));
-router.use("/products/recipes", require("../modules/products/recipes/recipes.routes"));
-router.use("/products", require("../modules/products/products.routes"));
+router.use("/recipes", require("../modules/recipes/recipes.routes"));
+
+//router.use("/products", require("../modules/products/products.routes"));
 router.use("/inventory-transitions", require("../modules/transitions").router);
 router.use("/approvals", require("../modules/approvals/approvals.routes"));
 
 // legacy
-router.post("/product-assemblies", (req,res,next)=> {
-  require("../modules/products/products.controller").assemble(req,res,next);
-});
+//router.post("/product-assemblies", (req,res,next)=> {
+//  require("../modules/products/products.controller").assemble(req,res,next);
+//});
 
 module.exports = router;
