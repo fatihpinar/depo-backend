@@ -39,4 +39,6 @@ router.post(
   controller.completeWork
 );
 
+router.post("/delete", controller.deleteItems);
+
 module.exports = router;

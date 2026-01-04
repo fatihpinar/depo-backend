@@ -56,7 +56,6 @@ exports.create = async (payload = {}) => {
 
     // 🔹 Yeni alanlar:
     stock_unit,          // "area" | "weight"
-    thickness_unit,      // "m" | "um"
   } = payload || {};
 
   // ---- Zorunlu alan kontrolleri ----
@@ -86,7 +85,7 @@ exports.create = async (payload = {}) => {
   }
 
   // ---- Stok birimi ("area" veya "weight") ----
-  const allowedStockUnits = ["area", "weight", "length", "unit"];
+  const allowedStockUnits = ["area", "weight", "length", "unit", "box_unit"];
 
   let finalStockUnit = (stock_unit || "").toLowerCase();
 
@@ -96,14 +95,6 @@ exports.create = async (payload = {}) => {
     e.message =
       "Geçerli bir stok birimi seçilmelidir (alan / ağırlık / uzunluk / adet).";
     throw e;
-  }
-
-  // ---- Kalınlık birimi ("m" veya "um") ----
-  let finalThicknessUnit = (thickness_unit || "").toLowerCase();
-  if (finalThicknessUnit !== "m" && finalThicknessUnit !== "um") {
-    // İstersen burada hata da fırlatabiliriz;
-    // şimdilik varsayılanı 'um' yapıyorum:
-    finalThicknessUnit = "um";
   }
 
   const client = await pool.connect();
@@ -138,42 +129,38 @@ exports.create = async (payload = {}) => {
 
     // 4) DB insert
     const insertSql = `
-      INSERT INTO masters (
-        product_type_id,
-        carrier_type_id,
-        supplier_id,
-        supplier_product_code,
-        thickness,
-        carrier_density,
-        carrier_color_id,
-        liner_color_id,
-        liner_type_id,
-        adhesive_type_id,
-        bimeks_code,
-        bimeks_product_name,
-        stock_unit,
-        thickness_unit
-      )
-      VALUES (
-        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14
-      )
-      RETURNING
-        id,
-        product_type_id,
-        carrier_type_id,
-        supplier_id,
-        supplier_product_code,
-        thickness,
-        carrier_density,
-        carrier_color_id,
-        liner_color_id,
-        liner_type_id,
-        adhesive_type_id,
-        bimeks_code,
-        bimeks_product_name,
-        stock_unit,
-        thickness_unit
-    `;
+    INSERT INTO masters (
+      product_type_id,
+      carrier_type_id,
+      supplier_id,
+      supplier_product_code,
+      thickness,
+      carrier_density,
+      carrier_color_id,
+      liner_color_id,
+      liner_type_id,
+      adhesive_type_id,
+      bimeks_code,
+      bimeks_product_name,
+      stock_unit
+    )
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+    RETURNING
+      id,
+      product_type_id,
+      carrier_type_id,
+      supplier_id,
+      supplier_product_code,
+      thickness,
+      carrier_density,
+      carrier_color_id,
+      liner_color_id,
+      liner_type_id,
+      adhesive_type_id,
+      bimeks_code,
+      bimeks_product_name,
+      stock_unit
+  `;
 
     const { rows } = await client.query(insertSql, [
       product_type_id,
@@ -189,7 +176,6 @@ exports.create = async (payload = {}) => {
       bimeks_code,
       bimeks_product_name.trim(),
       finalStockUnit,
-      finalThicknessUnit,
     ]);
 
     await client.query("COMMIT");

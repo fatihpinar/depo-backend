@@ -8,15 +8,20 @@ exports.findMany = async (filters = {}) => {
     locationId = 0,
     masterId = 0,
     availableOnly = false,
+    statusId,
+    includeDeleted = false,
   } = filters;
 
   let sql = `
     SELECT
       se.id, se.barcode,
       se.width, se.height, se.area,
-      se.weight, se.length,
+      se.weight, se.length, se.box_unit,
       se.invoice_no, se.created_at, se.created_by, se.approved_by,
       se.updated_at, se.approved_at, se.notes,
+      -- ✅ YENİ
+      se.supplier_barcode_no,
+      se.entry_type,
 
       cu.username AS created_by_username,
       cu.full_name AS created_by_full_name,
@@ -30,8 +35,6 @@ exports.findMany = async (filters = {}) => {
       pm.bimeks_product_name AS master_bimeks_product_name,   -- 🔧
       pm.bimeks_code AS master_bimeks_code,
       pm.stock_unit     AS master_stock_unit,
-      pm.thickness_unit AS master_thickness_unit,
-
 
       st.id AS status_id,
       st.code AS status_code,
@@ -53,6 +56,10 @@ exports.findMany = async (filters = {}) => {
   const where = [];
   const params = [];
 
+    // 🚫 Varsayılan: silinmişleri hariç tut
+  if (!includeDeleted) {
+    where.push(`se.status_id <> 8`);
+  }
   if (availableOnly) where.push(`se.status_id = 1`);
   if (warehouseId > 0) {
     params.push(warehouseId);
@@ -87,6 +94,7 @@ exports.findMany = async (filters = {}) => {
       OR pm.bimeks_product_name ILIKE $${p2}
       OR pm.bimeks_code ILIKE $${p2}          -- ✅ EKLE
       OR se.invoice_no ILIKE $${p2}
+      OR se.supplier_barcode_no ILIKE $${p2}
     )`);
   }
 
@@ -115,7 +123,6 @@ exports.findById = async (id) => {
       pm.bimeks_code AS master_bimeks_code,   -- 🔧
       pm.bimeks_code         AS master_code,
       pm.stock_unit          AS master_stock_unit,
-      pm.thickness_unit      AS master_thickness_unit,
       
       st.id AS status_id,
       st.code AS status_code,
@@ -145,11 +152,14 @@ exports.lockById = async (client, id) => {
        location_id,
        notes,
        invoice_no,
+       supplier_barcode_no,
+       entry_type,
        width,
        height,
        area,
        weight,
-       length
+       length,
+       box_unit
      FROM components
      WHERE id=$1
      FOR UPDATE`,
@@ -190,11 +200,14 @@ exports.updateFields = async (client, id, fields) => {
         location_id,
         notes,
         invoice_no,
+        supplier_barcode_no,
+        entry_type,
         width,
         height,
         area,
         weight,
-        length`,
+        length,
+        box_unit`,
     params
   );
   return rows[0];
@@ -212,7 +225,10 @@ exports.insertMany = async (client, entries) => {
     "area",
     "weight",
     "length",
+    "box_unit",
     "invoice_no",
+    "supplier_barcode_no",
+    "entry_type",
     "created_by",
   ];
 
@@ -222,8 +238,8 @@ exports.insertMany = async (client, entries) => {
   entries.forEach((e, i) => {
     const b = i * cols.length;
     placeholders.push(
-      `($${b + 1},$${b + 2},$${b + 3},$${b + 4},$${b + 5},$${b + 6},$${b + 7},$${b + 8},$${b + 9},$${b + 10},$${b + 11},$${b + 12})`
-    );
+    `($${b + 1},$${b + 2},$${b + 3},$${b + 4},$${b + 5},$${b + 6},$${b + 7},$${b + 8},$${b + 9},$${b + 10},$${b + 11},$${b + 12},$${b + 13},$${b + 14},$${b + 15})`
+  );
 
     params.push(
       e.master_id,
@@ -236,7 +252,10 @@ exports.insertMany = async (client, entries) => {
       e.area ?? null,
       e.weight ?? null,
       e.length ?? null,
+      e.box_unit ?? null,
       e.invoice_no ?? null,
+      e.supplier_barcode_no ?? null,
+      e.entry_type ?? null,
       e.created_by ?? null
     );
   });

@@ -10,6 +10,7 @@ const ACTION = Object.freeze({
   STATUS_CHANGE: "STATUS_CHANGE",
   ADJUST: "ADJUST",
   ATTRIBUTE_CHANGE: "ATTRIBUTE_CHANGE",
+  DELETE: "DELETE", 
 });
 
 // ——— YENİ: TR aksiyon ve (fallback) statü sözlükleri ———
@@ -23,6 +24,7 @@ const ACTION_LABEL_TR = Object.freeze({
   STATUS_CHANGE: "Durum değişti",
   ADJUST: "Düzeltme",
   ATTRIBUTE_CHANGE: "Özellik değişti",
+  DELETE: "Silindi",
 });
 
 const STATUS_LABEL_FALLBACK_TR = Object.freeze({
@@ -33,6 +35,7 @@ const STATUS_LABEL_FALLBACK_TR = Object.freeze({
   5: "Hasarlı / Kayıp",  // damaged_lost
   6: "Üretimde",         // production
   7: "Serigrafide",      // screenprint
+  8: "Silindi",          // deleted   
 });
 
 // ——— Yardımcılar ———

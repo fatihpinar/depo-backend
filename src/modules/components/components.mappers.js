@@ -1,18 +1,20 @@
-// src/modules/components/components.mappers.js
-
 exports.mapRowToApi = (r) => ({
   id: r.id,
   barcode: r.barcode,
 
-  // Artık unit & quantity yok
   width: r.width ?? null,
   height: r.height ?? null,
   area: r.area ?? null,
 
   weight: r.weight ?? null,
   length: r.length ?? null,
+  box_unit: r.box_unit ?? null,
 
   invoice_no: r.invoice_no ?? null,
+
+  // ✅ YENİ
+  supplier_barcode_no: r.supplier_barcode_no ?? null,
+  entry_type: r.entry_type ?? null,
 
   created_at: r.created_at,
   updated_at: r.updated_at,
@@ -48,12 +50,11 @@ exports.mapRowToApi = (r) => ({
     : undefined,
 
   master: r.master_id
-  ? {
-      id: r.master_id,
-      bimeks_product_name: r.master_bimeks_product_name || null,
-      bimeks_code: r.master_bimeks_code || r.master_code || null,
-      stock_unit: r.master_stock_unit || null,
-      thickness_unit: r.master_thickness_unit || null,
-    }
-  : undefined,
+    ? {
+        id: r.master_id,
+        bimeks_product_name: r.master_bimeks_product_name || null,
+        bimeks_code: r.master_bimeks_code || r.master_code || null,
+        stock_unit: r.master_stock_unit || null,
+      }
+    : undefined,
 });

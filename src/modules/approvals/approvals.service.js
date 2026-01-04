@@ -13,7 +13,7 @@ const { STATUS, LIST_STATUS_BY_SCOPE, DEPT_BY_SCOPE, KIND_TABLE } =
   require("./approvals.constants");
 
 /* ---------------- LIST ---------------- */
-exports.listPending = async ({ scope = "stock", limit = 100, offset = 0, search = "" } = {}) => {
+exports.listPending = async ({ scope = "stock", limit, offset = 0, search = "" } = {}) => {
   const statusToList = LIST_STATUS_BY_SCOPE[scope];
   if (!statusToList) return [];
 
@@ -27,11 +27,18 @@ exports.listPending = async ({ scope = "stock", limit = 100, offset = 0, search 
     quantity: r.quantity,
     width: r.width,
     height: r.height,
-    master: { id: r.master_id, display_label: r.display_label },
+    master: r.master_id
+      ? {
+          id: r.master_id,
+          display_label: r.display_label,
+          bimeks_code: r.bimeks_code ?? null,
+        }
+      : null,
     warehouse_id: r.warehouse_id,
     location_id: r.location_id,
   }));
 };
+
 
 /* ---------------- APPROVE ----------------
    - in_stock'a geçecekse barkod ZORUNLU + format/kind kontrolü
@@ -135,22 +142,8 @@ exports.approveItems = async (scope = "stock", items = [], actorId = null) => {
           to_location_id:    lc,
         });
       }
-            // Transitions
-      if (willMove) {
-        transitions.push({
-          item_type: it.kind === "component" ? ITEM_TYPE.COMPONENT : ITEM_TYPE.PRODUCT,
-          item_id: id,
-          action: ACTION.MOVE,
-          qty_delta: 0,
-          unit,
-          from_warehouse_id: prevWh || null,
-          from_location_id:  prevLc || null,
-          to_warehouse_id:   wh,
-          to_location_id:    lc,
-        });
-      }
 
-     // 🔹 Statü değişiyorsa APPROVE kaydı
+      // 🔹 Statü değişiyorsa APPROVE kaydı
       //    + eğer bu sırada barkod da değişmişse, meta içine göm
       if (prevStatus !== toStatus) {
         const approveMeta = changingBarcode
@@ -253,4 +246,49 @@ exports.approveItems = async (scope = "stock", items = [], actorId = null) => {
 */
 exports.completeWork = async (scope, items) => {
   return exports.approveItems(scope, items);
+};
+
+// src/modules/approvals/approvals.service.js
+// approvals.service.js
+exports.deleteItems = async (items = [], actorId = null) => {
+  if (!Array.isArray(items) || !items.length) {
+    const e = new Error("EMPTY_ITEMS");
+    e.status = 400;
+    throw e;
+  }
+
+  return repo.withTransaction(async (client) => {
+    const transitions = [];
+    const batchId = makeBatchId();
+
+    for (const it of items) {
+      const id = Number(it.id);
+      const table = KIND_TABLE[it.kind];
+      if (!table) throw new Error("INVALID_KIND");
+
+      const prev = await repo.lockItem(client, table, id);
+      if (!prev) throw new Error("ITEM_NOT_FOUND");
+
+      await repo.softDeleteItem(client, table, id, actorId);
+
+      transitions.push({
+        item_type:
+          it.kind === "component"
+            ? ITEM_TYPE.COMPONENT
+            : ITEM_TYPE.PRODUCT,
+        item_id: id,
+        action: ACTION.STATUS_CHANGE,
+        qty_delta: 0,
+        unit: prev.unit || "EA",
+        from_status_id: prev.status_id,
+        to_status_id: STATUS.deleted,
+      });
+    }
+
+    if (transitions.length) {
+      await recordTransitions(client, batchId, transitions, actorId);
+    }
+
+    return { ok: true, deleted: items.length };
+  });
 };

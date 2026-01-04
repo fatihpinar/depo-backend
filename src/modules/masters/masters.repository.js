@@ -103,10 +103,11 @@ exports.findMany = async (
       COALESCE(
         SUM(
           CASE
-            WHEN m.stock_unit = 'area'   THEN COALESCE(c.area, 0)
-            WHEN m.stock_unit = 'weight' THEN COALESCE(c.weight, 0)
-            WHEN m.stock_unit = 'length' THEN COALESCE(c.length, 0)
-            WHEN m.stock_unit = 'unit'   THEN 1
+            WHEN m.stock_unit = 'area'     THEN COALESCE(c.area, 0)
+            WHEN m.stock_unit = 'weight'   THEN COALESCE(c.weight, 0)
+            WHEN m.stock_unit = 'length'   THEN COALESCE(c.length, 0)
+            WHEN m.stock_unit = 'unit'     THEN 1
+            WHEN m.stock_unit = 'box_unit' THEN COALESCE(c.box_unit, 0)
             ELSE COALESCE(c.area, 0)
           END
         ),

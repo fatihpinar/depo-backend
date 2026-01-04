@@ -24,7 +24,7 @@ exports.withTransaction = async (fn) => {
  * --------------------------------------------------- */
 exports.listPendingUnion = async (
   statusToList,
-  { search = "", limit = 100, offset = 0 } = {}
+  { search = "", limit, offset = 0 } = {}
 ) => {
   const params = [];
   const push = (v) => {
@@ -32,7 +32,6 @@ exports.listPendingUnion = async (
     return `$${params.length}`;
   };
 
-  // ❗ master.display_label yerine bimeks_product_name / product_name kullanıyoruz
   const unionSql = `
   (
     SELECT
@@ -40,12 +39,10 @@ exports.listPendingUnion = async (
       c.id,
       c.barcode,
       m.id AS master_id,
+      m.bimeks_code AS bimeks_code,
       COALESCE(m.bimeks_product_name, CONCAT('#', m.id)) AS display_label,
-
-      -- 🔧 components tablosunda unit/quantity yok artık:
       'EA'::text AS unit,
       1         AS quantity,
-
       c.width,
       c.height,
       c.area,
@@ -63,12 +60,10 @@ exports.listPendingUnion = async (
       p.id,
       p.barcode,
       NULL::int AS master_id,
+      NULL::text AS bimeks_code,
       COALESCE(p.product_name, p.bimeks_code, CONCAT('#', p.id)) AS display_label,
-
-      -- ürünler için de şimdilik 1 EA varsayıyoruz:
       'EA'::text AS unit,
       1         AS quantity,
-
       NULL::numeric AS width,
       NULL::numeric AS height,
       NULL::numeric AS area,
@@ -83,21 +78,25 @@ exports.listPendingUnion = async (
   let where = "WHERE 1=1";
   if (search) {
     const term = `%${search}%`;
-    where += ` AND (t.barcode ILIKE ${push(term)} OR t.display_label ILIKE ${push(
-      term
-    )})`;
+    where += ` AND (t.barcode ILIKE ${push(term)} OR t.display_label ILIKE ${push(term)})`;
   }
+
+  // LIMIT opsiyonel, OFFSET her zaman uygulanabilir
+  const limitSql = limit !== undefined && limit !== null ? `LIMIT ${push(Number(limit))}` : "";
+  const offsetSql = offset ? `OFFSET ${push(Number(offset))}` : "";
 
   const sql = `
     SELECT * FROM (${unionSql}) t
     ${where}
     ORDER BY t.updated_at DESC
-    LIMIT ${push(limit)} OFFSET ${push(offset)}
+    ${limitSql}
+    ${offsetSql}
   `;
 
   const { rows } = await pool.query(sql, params);
   return rows;
 };
+
 
 /* -----------------------------------------------------
  * LOCK / LOOKUPS / UPDATE
@@ -139,8 +138,6 @@ exports.lockItem = async (client, table, id) => {
   return rows[0] || null;
 };
 
-
-
 exports.getWarehouseDepartment = async (client, whId) => {
   const { rows } = await client.query(
     `SELECT department FROM warehouses WHERE id=$1`,
@@ -156,6 +153,54 @@ exports.hasBarcodeConflict = async (client, table, barcode, id) => {
   );
   return !!rows.length;
 };
+
+exports.deleteItems = async (items = [], actorId = null) => {
+  if (!Array.isArray(items) || !items.length) {
+    const e = new Error("EMPTY_ITEMS");
+    e.status = 400;
+    throw e;
+  }
+
+  return repo.withTransaction(async (client) => {
+    for (const it of items) {
+      const table = KIND_TABLE[it.kind];
+      if (!table) {
+        const e = new Error("INVALID_KIND");
+        e.status = 400;
+        throw e;
+      }
+
+      // kilitle
+      const prev = await repo.lockItem(client, table, it.id);
+      if (!prev) {
+        const e = new Error("ITEM_NOT_FOUND");
+        e.status = 404;
+        throw e;
+      }
+
+      // soft delete
+      await repo.softDeleteItem(client, table, it.id, actorId);
+    }
+
+    return { ok: true, deleted: items.length };
+  });
+};
+
+
+exports.softDeleteItem = async (client, table, id, actorId = null) => {
+  await client.query(
+    `
+    UPDATE ${table}
+       SET status_id = $1,
+           updated_at = NOW(),
+           approved_by = $2,
+           approved_at = NOW()
+     WHERE id = $3
+    `,
+    [8, actorId, id] // 👈 STATUS.deleted = 8
+  );
+};
+
 
 exports.updateApproval = async (
   client,

@@ -7,6 +7,7 @@ const STATUS = {
   damaged_lost: 5,
   production:   6,
   screenprint:  7,
+  deleted:      8,
 };
 
 // List ekranında scope -> hangi status listelensin?

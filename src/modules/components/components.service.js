@@ -39,12 +39,13 @@ exports.getById = async (id) => {
 
 /* =============== UPDATE =============== */
 
-// src/modules/components/components.service.js
-
-// src/modules/components/components.service.js
-
 exports.update = async (id, payload = {}, actorId = null) => {
   const client = await pool.connect();
+
+  // ✅ en üste al
+  const getNumOrNull = (v) =>
+    v === undefined || v === null || v === "" ? null : Number(v);
+
   try {
     await client.query("BEGIN");
 
@@ -55,6 +56,13 @@ exports.update = async (id, payload = {}, actorId = null) => {
       throw e;
     }
 
+    // ✅ before geldikten sonra hesapla
+    const nextBoxUnit =
+      payload.box_unit !== undefined
+        ? getNumOrNull(payload.box_unit)
+        : getNumOrNull(before.box_unit);
+
+    
     // master değişebilir → doğru unit için master_id belirle
     const nextMasterId =
       payload.master_id !== undefined ? Number(payload.master_id) : Number(before.master_id);
@@ -92,9 +100,30 @@ exports.update = async (id, payload = {}, actorId = null) => {
 
     // Güncellenecek alanları topla (ortak alanlar)
     const fields = {};
-    for (const k of ["master_id", "status_id", "warehouse_id", "location_id", "notes", "invoice_no"]) {
+    for (const k of ["master_id", "status_id", "warehouse_id", "location_id", "notes", "invoice_no", "supplier_barcode_no", "entry_type",]) {
       if (payload[k] !== undefined) fields[k] = payload[k];
     }
+
+    if (payload.supplier_barcode_no !== undefined) {
+      fields.supplier_barcode_no =
+        payload.supplier_barcode_no === null || payload.supplier_barcode_no === ""
+          ? null
+          : String(payload.supplier_barcode_no).trim();
+    }
+
+    if (payload.entry_type !== undefined) {
+      const x = (payload.entry_type ?? "").toString().trim().toLowerCase();
+      if (!x) fields.entry_type = null;
+      else if (x === "count" || x === "purchase") fields.entry_type = x;
+      else {
+        const e = new Error("ENTRY_TYPE_INVALID");
+        e.status = 400;
+        e.code = "ENTRY_TYPE_INVALID";
+        e.message = "entry_type geçersiz (count|purchase).";
+        throw e;
+      }
+    }
+
 
     if (payload.barcode !== undefined) {
       fields.barcode = nextBarcode;
@@ -105,7 +134,7 @@ exports.update = async (id, payload = {}, actorId = null) => {
       v === undefined || v === null || v === "" ? null : Number(v);
 
     // hangi değeri baz alacağız? payload varsa onu, yoksa before'u
-    const nextWidth  = payload.width  !== undefined ? getNumOrNull(payload.width)  : getNumOrNull(before.width);
+    const nextWidth = payload.width !== undefined ? getNumOrNull(payload.width) : getNumOrNull(before.width);
     const nextHeight = payload.height !== undefined ? getNumOrNull(payload.height) : getNumOrNull(before.height);
     const nextWeight = payload.weight !== undefined ? getNumOrNull(payload.weight) : getNumOrNull(before.weight);
     const nextLength = payload.length !== undefined ? getNumOrNull(payload.length) : getNumOrNull(before.length);
@@ -140,7 +169,25 @@ exports.update = async (id, payload = {}, actorId = null) => {
       fields.height = null;
       fields.area = null;
       fields.length = null;
-    } else if (stockUnit === "length") {
+    }
+    else if (stockUnit === "box_unit") {
+      if (!Number.isFinite(nextBoxUnit) || nextBoxUnit <= 0) {
+        const e = new Error("BOX_UNIT_REQUIRED");
+        e.status = 400;
+        e.code = "BOX_UNIT_REQUIRED";
+        e.message = "box_unit biriminde Koli İçi Adet zorunludur (0'dan büyük).";
+        throw e;
+      }
+      fields.box_unit = nextBoxUnit;
+      // diğer ölçüler temiz
+      fields.width = null;
+      fields.height = null;
+      fields.area = null;
+      fields.weight = null;
+      fields.length = null;
+    }
+
+    else if (stockUnit === "length") {
       if (!Number.isFinite(nextLength) || nextLength <= 0) {
         const e = new Error("LENGTH_REQUIRED");
         e.status = 400;
@@ -217,14 +264,27 @@ exports.bulkCreate = async (entries, { actorId } = {}) => {
 
     const numOrNull = (v) => (v === undefined || v === null || v === "" ? null : Number(v));
 
+
     const prepared = entries.map((e, idx) => {
+      const normalizeEntryType = (v) => {
+        const x = (v ?? "").toString().trim().toLowerCase();
+        if (!x) return null;
+        if (x === "count" || x === "purchase") return x;
+        const e = new Error("VALIDATION_ERROR");
+        e.status = 400;
+        e.code = "VALIDATION_ERROR";
+        e.errors = [{ index: idx, field: "entry_type", message: "entry_type geçersiz (count|purchase)." }];
+        throw e;
+      };
+
       const master_id = Number(e.master_id);
       const stockUnit = masterUnitById.get(master_id) || "";
 
-      const width  = numOrNull(e.width);
+      const width = numOrNull(e.width);
       const height = numOrNull(e.height);
       const weight = numOrNull(e.weight);
       const length = numOrNull(e.length);
+      const boxUnit = numOrNull(e.box_unit);
 
       let out = {
         master_id,
@@ -237,8 +297,11 @@ exports.bulkCreate = async (entries, { actorId } = {}) => {
         area: null,
         weight: null,
         length: null,
+        box_unit: null,
         invoice_no: e.invoice_no ?? null,
+        supplier_barcode_no: e.supplier_barcode_no ? String(e.supplier_barcode_no).trim() : null,
         created_by: actorId || null,
+        entry_type: normalizeEntryType(e.entry_type),
       };
 
       if (stockUnit === "area") {
@@ -272,6 +335,16 @@ exports.bulkCreate = async (entries, { actorId } = {}) => {
           throw err;
         }
         out.length = length;
+      }
+      else if (stockUnit === "box_unit") {
+        if (!Number.isFinite(boxUnit) || boxUnit <= 0) {
+          const err = new Error("VALIDATION_ERROR");
+          err.status = 400;
+          err.code = "VALIDATION_ERROR";
+          err.errors = [{ index: idx, field: "box_unit", message: "box_unit biriminde Koli İçi Adet zorunludur." }];
+          throw err;
+        }
+        out.box_unit = boxUnit;
 
       } else if (stockUnit === "unit") {
         // ölçü yok → hepsi null
@@ -378,7 +451,7 @@ exports.exitMany = async (payload, actorId = null) => {
 
     const transitions = [];
 
-      for (const raw of rows) {
+    for (const raw of rows) {
       const compId = Number(raw.component_id || 0);
       const target = raw.target === "stock" ? "stock" : "sale"; // default: sale
       const qty = Number(raw.consume_qty || 0);                 // sadece sale için anlamlı
@@ -550,7 +623,7 @@ exports.exitMany = async (payload, actorId = null) => {
     }
 
 
-      if (transitions.length) {
+    if (transitions.length) {
       const batchId = makeBatchId();
       await recordTransitions(client, batchId, transitions, { actorId });
       await applyStockBalancesForComponentTransitions(client, transitions);
