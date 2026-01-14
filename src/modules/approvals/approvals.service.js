@@ -34,7 +34,7 @@ exports.listPending = async ({
     offset,
   });
 
-  return rows.map((r) => ({
+    return rows.map((r) => ({
     id: r.id,
     kind: r.kind,
     barcode: r.barcode,
@@ -42,6 +42,7 @@ exports.listPending = async ({
     quantity: r.quantity,
     width: r.width,
     height: r.height,
+
     master: r.master_id
       ? {
           id: r.master_id,
@@ -49,6 +50,10 @@ exports.listPending = async ({
           bimeks_code: r.bimeks_code ?? null,
         }
       : null,
+
+    // 👇 yalnızca ürünler için dolu olacak
+    product_name: r.kind === "product" ? (r.product_name || null) : null,
+
     warehouse_id: r.warehouse_id,
     location_id: r.location_id,
   }));

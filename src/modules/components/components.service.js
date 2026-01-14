@@ -124,14 +124,9 @@ exports.update = async (id, payload = {}, actorId = null) => {
       }
     }
 
-
     if (payload.barcode !== undefined) {
       fields.barcode = nextBarcode;
     }
-
-    // ✅ stock_unit'e göre zorunlu alan + normalize
-    const getNumOrNull = (v) =>
-      v === undefined || v === null || v === "" ? null : Number(v);
 
     // hangi değeri baz alacağız? payload varsa onu, yoksa before'u
     const nextWidth = payload.width !== undefined ? getNumOrNull(payload.width) : getNumOrNull(before.width);
@@ -447,24 +442,19 @@ exports.bulkCreate = async (entries, { actorId } = {}) => {
   }
 };
 
-// src/modules/components/components.service.js
-
+/**
+ * EXIT MANY — DOMAIN B CORRECT
+ */
 exports.exitMany = async (payload, actorId = null) => {
-  // 🔹 1) Payload'ı normalize et
   let rows;
 
-  if (Array.isArray(payload)) {
-    rows = payload;                 // eski kullanım: exitMany(rows, userId)
-  } else if (Array.isArray(payload?.rows)) {
-    rows = payload.rows;            // yeni kullanım: exitMany({ rows }, userId)
-  } else {
-    rows = [];
-  }
+  if (Array.isArray(payload)) rows = payload;
+  else if (Array.isArray(payload?.rows)) rows = payload.rows;
+  else rows = [];
 
   if (!rows.length) {
     const e = new Error("EMPTY_ROWS");
     e.status = 400;
-    e.code = "EMPTY_ROWS";
     throw e;
   }
 
@@ -475,301 +465,160 @@ exports.exitMany = async (payload, actorId = null) => {
     const transitions = [];
 
     for (const raw of rows) {
-      const compId = Number(raw.component_id || 0);
-      const target = raw.target === "stock" ? "stock" : "sale"; // default: sale
-      const qty = Number(raw.consume_qty || 0);                 // tüketilecek miktar (sale için)
+      const compId = Number(raw.component_id);
+      if (!compId) throw new Error("INVALID_COMPONENT_ID");
 
-      if (!compId) {
-        const e = new Error("INVALID_ROW");
-        e.status = 400;
-        e.code = "INVALID_ROW";
-        e.details = { compId };
-        throw e;
-      }
+      const mode = raw.mode === "quantity" ? "quantity" : "unit";
+      const target = raw.target === "stock" ? "stock" : "sale";
+      const qty = Number(raw.consume_qty || 0);
 
-      // 🔹 komponenti kilitle
+      // 1) Lock + fetch component
       const c = await repo.lockById(client, compId);
-      if (!c) {
-        const e = new Error("COMPONENT_NOT_FOUND");
-        e.status = 404;
-        e.code = "COMPONENT_NOT_FOUND";
-        throw e;
-      }
+      if (!c) throw new Error("COMPONENT_NOT_FOUND");
 
-      // 🔹 master'ın stok birimini getir
-      const { rows: ms } = await client.query(
-        `SELECT stock_unit FROM masters WHERE id = $1`,
+      // 2) Fetch master.stock_unit
+      const { rows: msRows } = await client.query(
+        `SELECT stock_unit FROM masters WHERE id=$1`,
         [c.master_id]
       );
-      const stockUnit = (ms[0]?.stock_unit || "").toString().trim().toLowerCase();
+      const stockUnit = (msRows[0]?.stock_unit || "").trim().toLowerCase();
 
-      // 🔹 hangi alanı kullanacağımıza ve mevcut miktara karar ver
-      let fieldName = null;
-      let have = 0;
+      // 3) Determine numeric field & current amount
+      const numericField =
+        stockUnit === "area"     ? "area" :
+        stockUnit === "length"   ? "length" :
+        stockUnit === "volume"   ? "volume" :
+        stockUnit === "weight"   ? "weight" :
+        stockUnit === "box_unit" ? "box_unit" :
+        null;
 
-      switch (stockUnit) {
-        case "area":
-          fieldName = "area";
-          have = Number(c.area || 0);
-          break;
-        case "weight":
-          fieldName = "weight";
-          have = Number(c.weight || 0);
-          break;
-        case "length":
-          fieldName = "length";
-          have = Number(c.length || 0);
-          break;
-        case "volume":
-          fieldName = "volume";
-          have = Number(c.volume || 0);
-          break;
-        case "box_unit":
-          fieldName = "box_unit";
-          have = Number(c.box_unit || 0);
-          break;
-        case "unit":
-          // unit'te her satır 1 adet kabul ediyoruz
-          fieldName = null; // numeric alan yok, sadece status ile yönetiyoruz
-          have = 1;
-          break;
-        default:
-          {
-            const e = new Error("MASTER_STOCK_UNIT_INVALID");
-            e.status = 400;
-            e.code = "MASTER_STOCK_UNIT_INVALID";
-            e.message = `master_id=${c.master_id} için stock_unit geçersiz/boş: "${stockUnit}"`;
-            throw e;
-          }
-      }
+      const have = numericField ? Number(c[numericField] || 0) : 1; // unit model = always 1 satır
 
-      if (!Number.isFinite(have) || have <= 0) {
-        const e = new Error("NO_STOCK");
-        e.status = 409;
-        e.code = "NO_STOCK";
-        e.message = "Bu kayıt için kullanılabilecek stok miktarı bulunmuyor.";
-        e.details = { stockUnit, have };
-        throw e;
-      }
+      // ========== UNIT EXIT ==========
+      if (mode === "unit") {
+        const newStatus =
+          target === "sale" ? STATUS.sold : STATUS.used;
 
-      const UNIT_LABEL = "EA";
-
-      /* ================== 1) SATIŞ (target === "sale") ================== */
-      if (target === "sale") {
-        if (!Number.isFinite(qty) || qty <= 0) {
-          const e = new Error("INVALID_ROW");
-          e.status = 400;
-          e.code = "INVALID_ROW";
-          e.details = { compId, qty };
-          throw e;
-        }
-
-        // unit biriminde satılacak miktarı 1 ile sınırla (bu satır 1 adeti temsil ediyor)
-        if (stockUnit === "unit" && qty !== 1) {
-          const e = new Error("UNIT_QTY_INVALID");
-          e.status = 400;
-          e.code = "UNIT_QTY_INVALID";
-          e.message = "unit biriminde tek kayıt üzerinden sadece 1 adet tüketilebilir.";
-          e.details = { qty };
-          throw e;
-        }
-
-        if (qty > have) {
-          const e = new Error("CONSUME_GT_STOCK");
-          e.status = 409;
-          e.code = "CONSUME_GT_STOCK";
-          e.details = { have, qty, stockUnit };
-          throw e;
-        }
-
-        let left = have - qty;
-
-        // 🔹 SATIŞ:
-        //  - KISMİ satışta statü DEĞİŞMEZ (ör: in_stock → in_stock)
-        //  - TAM satışta statü Satıldı'ya gider
-        let newStatus = c.status_id;
-        const fullyConsumed = left <= 0;
-
-        if (fullyConsumed) {
-          left = 0;
-          newStatus = STATUS.sold;
-        }
-
-        // güncellenecek alanlar
-        const updateFields = { status_id: newStatus };
-        if (fieldName) {
-          updateFields[fieldName] = left;
-        }
-
-        await repo.updateFields(client, c.id, updateFields);
-
-        // 🔹 transition meta'yı birime göre doldur
         const meta = {
-          target: "sale",
+          target,
           unit_type: stockUnit,
-          consumed: qty,
-          remaining: left,
-          fully_consumed: fullyConsumed,
+          mode: "unit",
+          consumed: have,
+          remaining: 0,
+          fully_consumed: true,
         };
 
-        if (stockUnit === "area") {
-          meta.consumed_area = qty;
-          meta.remaining_area = left;
-        } else if (stockUnit === "weight") {
-          meta.consumed_weight = qty;
-          meta.remaining_weight = left;
-        } else if (stockUnit === "length") {
-          meta.consumed_length = qty;
-          meta.remaining_length = left;
-        } else if (stockUnit === "volume") {
-          meta.consumed_volume = qty;
-          meta.remaining_volume = left;
-        } else if (stockUnit === "box_unit") {
-          meta.consumed_box_unit = qty;
-          meta.remaining_box_unit = left;
-        } else if (stockUnit === "unit") {
-          meta.consumed_unit = qty;
-          meta.remaining_unit = left;
+        if (numericField) {
+          meta[`consumed_${numericField}`] = have;
+          meta[`remaining_${numericField}`] = 0;
+        } else {
+          meta.consumed_unit = 1;
+          meta.remaining_unit = 0;
         }
 
+        // Apply component update
+        await repo.updateFields(client, compId, {
+          status_id: newStatus,
+          ...(numericField ? { [numericField]: 0 } : {}),
+        });
+
+        // Transition
         transitions.push({
           item_type: ITEM_TYPE.COMPONENT,
-          item_id: c.id,
-          action: ACTION.CONSUME,      // tüketim
-          qty_delta: 0,                // adet değişmiyor, miktar alanından düşüyoruz
-          unit: UNIT_LABEL,
+          item_id: compId,
+          action: ACTION.CONSUME,
+          qty_delta: 0,
+          unit: "EA",
           from_status_id: c.status_id,
           to_status_id: newStatus,
-          from_warehouse_id: c.warehouse_id || null,
-          from_location_id: c.location_id || null,
-          to_warehouse_id: c.warehouse_id || null,
-          to_location_id: c.location_id || null,
+          from_warehouse_id: c.warehouse_id,
+          from_location_id: c.location_id,
+          to_warehouse_id: c.warehouse_id,
+          to_location_id: c.location_id,
           context_type: "component_exit",
           context_id: null,
           meta,
         });
+
+        continue;
       }
 
-      /* ============ 2) DEPOYA TRANSFER (target === "stock") ============= */
-      else {
-        // 🔹 Burada her zaman komponentin TÜM miktarını yeni depo/lokasyona taşıyoruz.
-        const whId = Number(raw.warehouse_id || 0);
-        const locId = Number(raw.location_id || 0);
-        if (!whId || !locId) {
-          const e = new Error("WAREHOUSE_LOCATION_REQUIRED");
-          e.status = 400;
-          e.code = "WAREHOUSE_LOCATION_REQUIRED";
-          throw e;
-        }
-
-        const beforeStatus = c.status_id;
-        const beforeWh = c.warehouse_id || null;
-        const beforeLc = c.location_id || null;
-
-        // Statü değişmiyor, sadece depo/lokasyon değişiyor
-        const newStatus = beforeStatus;
-
-        // Komponent kaydını güncelle:
-        const updateFields = {
-          status_id: newStatus,
-          warehouse_id: whId,
-          location_id: locId,
-        };
-        if (fieldName) {
-          // miktar aynı kalıyor, sadece lokasyon değişiyor
-          updateFields[fieldName] = have;
-        }
-
-        await repo.updateFields(client, c.id, updateFields);
-
-        // 🔹 meta hazırlığı (eski lokasyondan çıkar, yeni lokasyona ekle)
-        const metaBase = {
-          target: "stock",
-          unit_type: stockUnit,
-          move_full: true,
-        };
-
-        const metaFrom = { ...metaBase };
-        const metaTo = { ...metaBase };
-
-        if (stockUnit === "area") {
-          metaFrom.consumed_area = have;  // eski yerden have kadar düş
-          metaFrom.remaining_area = 0;
-          metaTo.area = have;             // yeni yerde have kadar ekle
-          metaTo.remaining_area = have;
-        } else if (stockUnit === "weight") {
-          metaFrom.consumed_weight = have;
-          metaFrom.remaining_weight = 0;
-          metaTo.weight = have;
-          metaTo.remaining_weight = have;
-        } else if (stockUnit === "length") {
-          metaFrom.consumed_length = have;
-          metaFrom.remaining_length = 0;
-          metaTo.length = have;
-          metaTo.remaining_length = have;
-        } else if (stockUnit === "volume") {
-          metaFrom.consumed_volume = have;
-          metaFrom.remaining_volume = 0;
-          metaTo.volume = have;
-          metaTo.remaining_volume = have;
-        } else if (stockUnit === "box_unit") {
-          metaFrom.consumed_box_unit = have;
-          metaFrom.remaining_box_unit = 0;
-          metaTo.box_unit = have;
-          metaTo.remaining_box_unit = have;
-        } else if (stockUnit === "unit") {
-          metaFrom.consumed_unit = have;
-          metaFrom.remaining_unit = 0;
-          metaTo.unit = have;
-          metaTo.remaining_unit = have;
-        }
-
-        // 1) Eski depo/lokasyondan tamamını düş
-        transitions.push({
-          item_type: ITEM_TYPE.COMPONENT,
-          item_id: c.id,
-          action: ACTION.ADJUST,
-          qty_delta: 0,
-          unit: UNIT_LABEL,
-          from_status_id: beforeStatus,
-          to_status_id: beforeStatus,
-          from_warehouse_id: beforeWh,
-          from_location_id: beforeLc,
-          to_warehouse_id: beforeWh,
-          to_location_id: beforeLc,
-          context_type: "component_exit",
-          context_id: null,
-          meta: metaFrom,
-        });
-
-        // 2) Yeni depo/lokasyona tamamını ekle
-        transitions.push({
-          item_type: ITEM_TYPE.COMPONENT,
-          item_id: c.id,
-          action: ACTION.ADJUST,
-          qty_delta: 0,
-          unit: UNIT_LABEL,
-          from_status_id: newStatus,
-          to_status_id: newStatus,
-          from_warehouse_id: whId,
-          from_location_id: locId,
-          to_warehouse_id: whId,
-          to_location_id: locId,
-          context_type: "component_exit",
-          context_id: null,
-          meta: metaTo,
-        });
+      // ========== QUANTITY EXIT ==========
+      if (!numericField) {
+        const e = new Error("INVALID_QUANTITY_FOR_UNIT_TYPE");
+        e.status = 400;
+        throw e;
       }
+
+      if (qty <= 0) {
+        const e = new Error("INVALID_CONSUME_QTY");
+        e.status = 400;
+        throw e;
+      }
+
+      if (have <= 0) {
+        const e = new Error("NO_STOCK");
+        e.status = 409;
+        throw e;
+      }
+
+      if (qty > have) {
+        const e = new Error("CONSUME_GT_STOCK");
+        e.status = 409;
+        throw e;
+      }
+
+      const left = have - qty;
+      const fully = left === 0;
+
+      const newStatus =
+        fully
+          ? (target === "sale" ? STATUS.sold : STATUS.used)
+          : c.status_id;
+
+      const meta = {
+        target,
+        unit_type: stockUnit,
+        mode: "quantity",
+        consumed: qty,
+        remaining: left,
+        fully_consumed: fully,
+      };
+
+      meta[`consumed_${numericField}`] = qty;
+      meta[`remaining_${numericField}`] = left;
+
+      // Write component update
+      await repo.updateFields(client, compId, {
+        status_id: newStatus,
+        [numericField]: left,
+      });
+
+      transitions.push({
+        item_type: ITEM_TYPE.COMPONENT,
+        item_id: compId,
+        action: ACTION.CONSUME,
+        qty_delta: 0,
+        unit: "EA",
+        from_status_id: c.status_id,
+        to_status_id: newStatus,
+        from_warehouse_id: c.warehouse_id,
+        from_location_id: c.location_id,
+        to_warehouse_id: c.warehouse_id,
+        to_location_id: c.location_id,
+        context_type: "component_exit",
+        context_id: null,
+        meta,
+      });
     }
 
     if (transitions.length) {
-      const batchId = makeBatchId();
-      await recordTransitions(client, batchId, transitions, { actorId });
+      const batch = makeBatchId();
+      await recordTransitions(client, batch, transitions, { actorId });
       await applyStockBalancesForComponentTransitions(client, transitions);
     }
 
     await client.query("COMMIT");
-
     return { processed: rows.length };
   } catch (err) {
     await client.query("ROLLBACK");

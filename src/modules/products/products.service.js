@@ -25,6 +25,66 @@ const STATUS_IDS = {
   screenprint: 7,
 };
 
+// ---- ASSEMBLE yardımcıları ----
+
+// component + master.stock_unit ile lock al
+async function lockComponentForAssemble(client, id) {
+  const { rows } = await client.query(
+    `
+      SELECT
+        c.id,
+        c.master_id,
+        c.status_id,
+        c.warehouse_id,
+        c.location_id,
+        c.width,
+        c.height,
+        c.area,
+        c.weight,
+        c.length,
+        c.volume,
+        c.box_unit,
+        m.stock_unit
+      FROM components c
+      JOIN masters m ON m.id = c.master_id
+      WHERE c.id = $1
+      FOR UPDATE
+    `,
+    [id]
+  );
+  return rows[0] || null;
+}
+
+// hangi kolondan stok okuyacağız?
+function getComponentMeasureForAssemble(row) {
+  const unit = String(row.stock_unit || "").toLowerCase();
+
+  if (unit === "area") {
+    const have = Number(row.area || 0);
+    return { numericField: "area", have, unitLabel: "m2" };
+  }
+  if (unit === "weight") {
+    const have = Number(row.weight || 0);
+    return { numericField: "weight", have, unitLabel: "kg" };
+  }
+  if (unit === "length") {
+    const have = Number(row.length || 0);
+    return { numericField: "length", have, unitLabel: "m" };
+  }
+  if (unit === "volume") {
+    const have = Number(row.volume || 0);
+    return { numericField: "volume", have, unitLabel: "lt" };
+  }
+  if (unit === "box_unit") {
+    const have = Number(row.box_unit || 0);
+    return { numericField: "box_unit", have, unitLabel: "ea" };
+  }
+
+  // fallback: adetlik ürün (her satır 1 adet)
+  return { numericField: null, have: 1, unitLabel: "ea" };
+}
+
+
 /* ======================== READ ======================== */
 
 exports.list = async (filters = {}) => {
@@ -162,33 +222,50 @@ const ASSEMBLE_STATUS = {
 };
 
 exports.assemble = async (payload, actorId = null) => {
-  if (!payload || !payload.product || !Array.isArray(payload.components) || !payload.components.length) {
-    const e = new Error("INVALID_PAYLOAD"); e.status = 400; e.code = "INVALID_PAYLOAD"; throw e;
+  if (
+    !payload ||
+    !payload.product ||
+    !Array.isArray(payload.components) ||
+    !payload.components.length
+  ) {
+    const e = new Error("INVALID_PAYLOAD");
+    e.status = 400;
+    e.code = "INVALID_PAYLOAD";
+    throw e;
   }
-    const { product, components } = payload;
 
-  const target      = String(product.target || "").trim();
+  const { product, components } = payload;
+
+  const target = String(product.target || "").trim();
   const productName = String(product.product_name || "").trim();
-  const recipeId    = product.recipe_id ? String(product.recipe_id) : null;
+  const recipeId = product.recipe_id ? String(product.recipe_id) : null;
 
   // Artık sadece ürün adı ve hedef zorunlu
   if (!productName || !target) {
     const e = new Error("MISSING_PRODUCT_FIELDS");
     e.status = 400;
-    e.code   = "MISSING_PRODUCT_FIELDS";
+    e.code = "MISSING_PRODUCT_FIELDS";
     throw e;
   }
 
-
-    if (!["stock","production","screenprint"].includes(target)) {
-    const e = new Error("INVALID_TARGET"); e.status = 400; e.code = "INVALID_TARGET"; throw e;
+  if (!["stock", "production", "screenprint"].includes(target)) {
+    const e = new Error("INVALID_TARGET");
+    e.status = 400;
+    e.code = "INVALID_TARGET";
+    throw e;
   }
-  if (target === "stock" && (!product.warehouse_id || !product.location_id)) {
-    const e = new Error("WAREHOUSE_LOCATION_REQUIRED"); e.status = 400; e.code = "WAREHOUSE_LOCATION_REQUIRED"; throw e;
+
+  if (
+    target === "stock" &&
+    (!product.warehouse_id || !product.location_id)
+  ) {
+    const e = new Error("WAREHOUSE_LOCATION_REQUIRED");
+    e.status = 400;
+    e.code = "WAREHOUSE_LOCATION_REQUIRED";
+    throw e;
   }
 
-
-    const client = await pool.connect();
+  const client = await pool.connect();
   try {
     await client.query("BEGIN");
 
@@ -198,105 +275,177 @@ exports.assemble = async (payload, actorId = null) => {
       bimeks_code: (product.bimeks_code || "").trim() || null,
       status_id,
       warehouse_id: target === "stock" ? product.warehouse_id || null : null,
-      location_id:  target === "stock" ? product.location_id  || null : null,
+      location_id: target === "stock" ? product.location_id || null : null,
       product_name: productName,
-      recipe_id:    recipeId,
-      created_by:   actorId || null,
+      recipe_id: recipeId,
+      created_by: actorId || null,
     });
 
     const consumeTransitions = [];
 
-    // src/modules/products/products.service.js → assemble() içinde for döngüsü
-
-    // products.service.js → assemble() içinde
-
+    // === HER COMPONENT İÇİN STOK DÜŞ ===
     for (const item of components) {
-    const compId = Number(item.component_id || 0);
-    if (!compId) {
-      const e = new Error("INVALID_COMPONENT_ID");
-      e.status = 400;
-      e.code   = "INVALID_COMPONENT_ID";
-      throw e;
+      const compId = Number(item.component_id || 0);
+      if (!compId) {
+        const e = new Error("INVALID_COMPONENT_ID");
+        e.status = 400;
+        e.code = "INVALID_COMPONENT_ID";
+        throw e;
+      }
+
+      const requested = Number(item.consume_qty || 0);
+      if (!Number.isFinite(requested) || requested <= 0) {
+        const e = new Error("INVALID_CONSUME_QTY");
+        e.status = 400;
+        e.code = "INVALID_CONSUME_QTY";
+        throw e;
+      }
+
+      const comp = await lockComponentForAssemble(client, compId);
+      if (!comp) {
+        const e = new Error("COMPONENT_NOT_FOUND");
+        e.status = 404;
+        e.code = "COMPONENT_NOT_FOUND";
+        throw e;
+      }
+
+      const {
+        numericField,
+        have,
+        unitLabel,
+      } = getComponentMeasureForAssemble(comp);
+
+      // stok yoksa
+      if (!Number.isFinite(have) || have <= 0) {
+        const e = new Error("NO_STOCK");
+        e.status = 409;
+        e.code = "NO_STOCK";
+        throw e;
+      }
+
+      // adetlik ürün (numericField yok) için: sadece 1 adet tüketilebilir
+      if (!numericField) {
+        if (requested > 1) {
+          const e = new Error("CONSUME_GT_STOCK");
+          e.status = 409;
+          e.code = "CONSUME_GT_STOCK";
+          throw e;
+        }
+
+        // tek adetlik ürünü komple kullanıyoruz
+        await client.query(
+          `
+            UPDATE components
+               SET status_id = $1,
+                   updated_at = NOW()
+             WHERE id = $2
+          `,
+          [STATUS_IDS.used, comp.id]
+        );
+
+        await repo.insertProductComponentLink(client, {
+          product_id: productId,
+          component_id: comp.id,
+          consume_qty: 1,
+        });
+
+        consumeTransitions.push({
+          item_type: ITEM_TYPE.COMPONENT,
+          item_id: comp.id,
+          action: ACTION.CONSUME,
+          qty_delta: -1,
+          unit: unitLabel,
+          from_warehouse_id: comp.warehouse_id || null,
+          from_location_id: comp.location_id || null,
+          to_status_id: STATUS_IDS.used,
+          context_type: "product",
+          context_id: productId,
+        });
+
+        continue;
+      }
+
+      // ölçülü ürünler (area / length / weight / volume / box_unit)
+      if (requested > have) {
+        const e = new Error("CONSUME_GT_STOCK");
+        e.status = 409;
+        e.code = "CONSUME_GT_STOCK";
+        throw e;
+      }
+
+      const left = have - requested;
+      const fullyConsumed = left === 0;
+      const newStatus = fullyConsumed ? STATUS_IDS.used : comp.status_id;
+
+      // stok düş
+      const params = [left];
+      let setClause = `${numericField} = $1`;
+
+      if (fullyConsumed) {
+        params.push(newStatus);
+        setClause += ", status_id = $2";
+      }
+
+      // updated_at
+      const idParamIndex = params.length + 1;
+      setClause += ", updated_at = NOW()";
+
+      params.push(comp.id);
+
+      await client.query(
+        `
+          UPDATE components
+             SET ${setClause}
+           WHERE id = $${idParamIndex}
+        `,
+        params
+      );
+
+      // product_components kaydı
+      await repo.insertProductComponentLink(client, {
+        product_id: productId,
+        component_id: comp.id,
+        consume_qty: requested,
+      });
+
+      // transition
+      consumeTransitions.push({
+        item_type: ITEM_TYPE.COMPONENT,
+        item_id: comp.id,
+        action: ACTION.CONSUME,
+        qty_delta: -requested,
+        unit: unitLabel,
+        from_warehouse_id: comp.warehouse_id || null,
+        from_location_id: comp.location_id || null,
+        to_status_id: fullyConsumed
+          ? STATUS_IDS.used
+          : STATUS_IDS.in_stock,
+        context_type: "product",
+        context_id: productId,
+      });
     }
-
-    // FE HER ZAMAN ALAN GÖNDERİYOR (um²/m²)
-    const requested = Number(item.consume_qty || 0);
-    if (!Number.isFinite(requested) || requested <= 0) {
-      const e = new Error("INVALID_CONSUME_QTY");
-      e.status = 400;
-      e.code   = "INVALID_CONSUME_QTY";
-      throw e;
-    }
-
-    const comp = await repo.lockComponentById(client, compId);
-    if (!comp) {
-      const e = new Error("COMPONENT_NOT_FOUND");
-      e.status = 404;
-      e.code   = "COMPONENT_NOT_FOUND";
-      throw e;
-    }
-
-    // 🔴 KRİTİK: STOK HER ZAMAN ALAN → area
-    const currentArea = Number(comp.area || 0);
-    if (!Number.isFinite(currentArea) || currentArea <= 0) {
-      const e = new Error("NO_STOCK");
-      e.status = 409;
-      e.code   = "NO_STOCK";
-      throw e;
-    }
-
-    if (requested > currentArea) {
-      const e = new Error("CONSUME_GT_STOCK");
-      e.status = 409;
-      e.code   = "CONSUME_GT_STOCK";
-      throw e;
-    }
-
-    const leftArea = currentArea - requested;
-
-    // 🟢 ORİJİNAL COMPONENT’İN STOK ALANI DÜŞÜYOR
-    const updateFields = {
-      area: leftArea,
-      quantity: leftArea,             // istersen bırak, istersen hiç set etme
-    };
-    if (leftArea === 0) {
-      updateFields.status_id = STATUS_IDS.used;
-    }
-
-    await repo.updateComponentFields(client, comp.id, updateFields);
-
-    // 🟢 PRODUCT_COMPONENTS: CONSUME_QTY = KULLANILAN ALAN
-    await repo.insertProductComponentLink(client, {
-      product_id: productId,
-      component_id: comp.id,
-      consume_qty: requested,
-    });
-
-    // 🟢 TRANSITION: alan kadar tüketim
-    consumeTransitions.push({
-      item_type: ITEM_TYPE.COMPONENT,
-      item_id: comp.id,
-      action: ACTION.CONSUME,
-      qty_delta: -requested,
-      unit: comp.unit || "EA", // burada sadece label; um²/m² vs düşün
-      from_warehouse_id: comp.warehouse_id || null,
-      from_location_id: comp.location_id || null,
-      to_status_id: leftArea === 0 ? STATUS_IDS.used : STATUS_IDS.in_stock,
-      context_type: "product",
-      context_id: productId,
-    });
-  }
-
-
-
 
     const batchId = makeBatchId();
-    await recordTransitions(client, batchId, [{
-      item_type: ITEM_TYPE.PRODUCT, item_id: productId, action: ACTION.ASSEMBLE_PRODUCT,
-      qty_delta: 1, unit: "EA", to_status_id: status_id,
-      to_warehouse_id: target === "stock" ? product.warehouse_id || null : null,
-      to_location_id:  target === "stock" ? product.location_id  || null : null,
-    }, ...consumeTransitions], actorId);
+    await recordTransitions(
+      client,
+      batchId,
+      [
+        {
+          item_type: ITEM_TYPE.PRODUCT,
+          item_id: productId,
+          action: ACTION.ASSEMBLE_PRODUCT,
+          qty_delta: 1,
+          unit: "EA",
+          to_status_id: status_id,
+          to_warehouse_id:
+            target === "stock" ? product.warehouse_id || null : null,
+          to_location_id:
+            target === "stock" ? product.location_id || null : null,
+        },
+        ...consumeTransitions,
+      ],
+      actorId
+    );
 
     await client.query("COMMIT");
     return { product: { id: productId } };
@@ -307,6 +456,7 @@ exports.assemble = async (payload, actorId = null) => {
     client.release();
   }
 };
+
 
 /* ============ REMOVE COMPONENTS (iade / hurda) ============ */
 
