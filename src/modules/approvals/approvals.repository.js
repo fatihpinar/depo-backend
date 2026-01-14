@@ -138,6 +138,7 @@ exports.lockItem = async (client, table, id) => {
   return rows[0] || null;
 };
 
+
 exports.getWarehouseDepartment = async (client, whId) => {
   const { rows } = await client.query(
     `SELECT department FROM warehouses WHERE id=$1`,

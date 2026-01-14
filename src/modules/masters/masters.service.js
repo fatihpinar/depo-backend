@@ -27,6 +27,25 @@ async function getDisplayCode(client, table, id, pad = 0, defaultCode = "00") {
   return code;
 }
 
+// Sadece carrier_types.display_code2 için yardımcı
+async function getCarrierTypeDisplayCode2(
+  client,
+  carrierTypeId,
+  pad = 0,
+  defaultCode = "0"
+) {
+  if (!carrierTypeId) return defaultCode;
+  const { rows } = await client.query(
+    `SELECT display_code2 FROM carrier_types WHERE id = $1`,
+    [carrierTypeId]
+  );
+  if (!rows[0] || !rows[0].display_code2) return defaultCode;
+
+  let code = String(rows[0].display_code2).trim();
+  if (pad > 0) code = code.padStart(pad, "0");
+  return code;
+}
+
 // Sayısal alanları (kalınlık / yoğunluk) kodlamak için
 function numericToCode(value, totalDigits) {
   if (value === null || value === undefined || value === "") {
@@ -37,9 +56,7 @@ function numericToCode(value, totalDigits) {
   return normalized.padStart(totalDigits, "0");
 }
 
-
 /* ========== CREATE (YENİ MİMARİ) ========== */
-
 exports.create = async (payload = {}) => {
   const {
     product_type_id,
@@ -55,7 +72,7 @@ exports.create = async (payload = {}) => {
     bimeks_product_name,
 
     // 🔹 Yeni alanlar:
-    stock_unit,          // "area" | "weight"
+    stock_unit,          // "area" | "weight" | "length" | "unit" | "box_unit" | "volume"
   } = payload || {};
 
   // ---- Zorunlu alan kontrolleri ----
@@ -84,8 +101,8 @@ exports.create = async (payload = {}) => {
     throw e;
   }
 
-  // ---- Stok birimi ("area" veya "weight") ----
-  const allowedStockUnits = ["area", "weight", "length", "unit", "box_unit"];
+  // ---- Stok birimi ("area" veya "weight" vs) ----
+  const allowedStockUnits = ["area", "weight", "length", "unit", "box_unit", "volume"];
 
   let finalStockUnit = (stock_unit || "").toLowerCase();
 
@@ -93,7 +110,7 @@ exports.create = async (payload = {}) => {
     const e = new Error("STOCK_UNIT_REQUIRED");
     e.status = 400;
     e.message =
-      "Geçerli bir stok birimi seçilmelidir (alan / ağırlık / uzunluk / adet).";
+      "Geçerli bir stok birimi seçilmelidir (alan / ağırlık / uzunluk / adet / kutu / hacim).";
     throw e;
   }
 
@@ -110,57 +127,71 @@ exports.create = async (payload = {}) => {
     const linerTypeCode    = await getDisplayCode(client, "liner_types",    liner_type_id,    0, "00");
     const adhesiveTypeCode = await getDisplayCode(client, "adhesive_types", adhesive_type_id, 0, "0");
 
-    // 2) Kalınlık ve yoğunluk kodları
-    const thicknessCode = numericToCode(thickness, 4);
-    const densityCode   = numericToCode(carrier_density, 3);
+    // 🔹 carrier_types.display_code2
+    const carrierTypeCode2 = await getCarrierTypeDisplayCode2(
+      client,
+      carrier_type_id,
+      0,
+      "0"
+    );
 
-    // 3) Bimeks kodu
+    // 2) Kalınlık ve yoğunluk kodları
+
+    // thickness: kaç hane gelirse gelsin aynen (mm → µm dönüşümü FE’de zaten yapılıyor)
+    const thicknessCode = numericToCode(thickness, 0);       // 50 → "50", 10000 → "10000"
+
+    // density: istersen hâlâ 3 haneli kalsın
+    const densityCode   = numericToCode(carrier_density, 3); // 20 → "020"
+
+
+    // 3) Bimeks kodu (yeni kural)
     const bimeks_code = [
-      supplierCode,
-      productTypeCode,
-      carrierTypeCode,
-      thicknessCode,
-      carrierColorCode,
-      densityCode,
-      linerColorCode,
-      linerTypeCode,
-      adhesiveTypeCode,
+      supplierCode,      // suppliers.display_code
+      productTypeCode,   // product_types.display_code
+      carrierTypeCode,   // carrier_types.display_code
+      thicknessCode,     // girilen thickness (4 hane string)
+      carrierColorCode,  // carrier_colors.display_code
+      densityCode,       // carrier_density (3 hane string)
+      linerColorCode,    // liner_colors.display_code
+      linerTypeCode,     // liner_types.display_code
+      adhesiveTypeCode,  // adhesive_types.display_code
+      carrierTypeCode2,  // carrier_types.display_code2
     ].join("");
 
     // 4) DB insert
     const insertSql = `
-    INSERT INTO masters (
-      product_type_id,
-      carrier_type_id,
-      supplier_id,
-      supplier_product_code,
-      thickness,
-      carrier_density,
-      carrier_color_id,
-      liner_color_id,
-      liner_type_id,
-      adhesive_type_id,
-      bimeks_code,
-      bimeks_product_name,
-      stock_unit
-    )
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
-    RETURNING
-      id,
-      product_type_id,
-      carrier_type_id,
-      supplier_id,
-      supplier_product_code,
-      thickness,
-      carrier_density,
-      carrier_color_id,
-      liner_color_id,
-      liner_type_id,
-      adhesive_type_id,
-      bimeks_code,
-      bimeks_product_name,
-      stock_unit
-  `;
+      INSERT INTO masters (
+        product_type_id,
+        carrier_type_id,
+        supplier_id,
+        supplier_product_code,
+        thickness,
+        carrier_density,
+        carrier_color_id,
+        liner_color_id,
+        liner_type_id,
+        adhesive_type_id,
+        bimeks_code,
+        bimeks_product_name,
+        stock_unit
+      )
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+      RETURNING
+        id,
+        product_type_id,
+        carrier_type_id,
+        supplier_id,
+        supplier_product_code,
+        thickness,
+        carrier_density,
+        carrier_color_id,
+        liner_color_id,
+        liner_type_id,
+        adhesive_type_id,
+        bimeks_code,
+        bimeks_product_name,
+        stock_unit
+    `;
 
     const { rows } = await client.query(insertSql, [
       product_type_id,
@@ -197,4 +228,3 @@ exports.update = async (id, payload = {}) => {
   await repo.updateOne(id, payload);
   return repo.findJoinedById(id);
 };
-

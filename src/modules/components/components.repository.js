@@ -16,8 +16,9 @@ exports.findMany = async (filters = {}) => {
     SELECT
       se.id, se.barcode,
       se.width, se.height, se.area,
-      se.weight, se.length, se.box_unit,
+      se.weight, se.length, se.volume, se.box_unit,
       se.invoice_no, se.created_at, se.created_by, se.approved_by,
+
       se.updated_at, se.approved_at, se.notes,
       -- ✅ YENİ
       se.supplier_barcode_no,
@@ -159,6 +160,7 @@ exports.lockById = async (client, id) => {
        area,
        weight,
        length,
+       volume,
        box_unit
      FROM components
      WHERE id=$1
@@ -167,6 +169,7 @@ exports.lockById = async (client, id) => {
   );
   return rows[0] || null;
 };
+
 
 exports.updateFields = async (client, id, fields) => {
   const cols = Object.keys(fields);
@@ -207,6 +210,7 @@ exports.updateFields = async (client, id, fields) => {
         area,
         weight,
         length,
+        volume,
         box_unit`,
     params
   );
@@ -225,6 +229,7 @@ exports.insertMany = async (client, entries) => {
     "area",
     "weight",
     "length",
+    "volume",
     "box_unit",
     "invoice_no",
     "supplier_barcode_no",
@@ -232,15 +237,15 @@ exports.insertMany = async (client, entries) => {
     "created_by",
   ];
 
+
   const placeholders = [];
   const params = [];
 
   entries.forEach((e, i) => {
     const b = i * cols.length;
     placeholders.push(
-    `($${b + 1},$${b + 2},$${b + 3},$${b + 4},$${b + 5},$${b + 6},$${b + 7},$${b + 8},$${b + 9},$${b + 10},$${b + 11},$${b + 12},$${b + 13},$${b + 14},$${b + 15})`
+  `($${b + 1},$${b + 2},$${b + 3},$${b + 4},$${b + 5},$${b + 6},$${b + 7},$${b + 8},$${b + 9},$${b + 10},$${b + 11},$${b + 12},$${b + 13},$${b + 14},$${b + 15},$${b + 16})`
   );
-
     params.push(
       e.master_id,
       e.barcode,
@@ -252,6 +257,7 @@ exports.insertMany = async (client, entries) => {
       e.area ?? null,
       e.weight ?? null,
       e.length ?? null,
+      e.volume ?? null,
       e.box_unit ?? null,
       e.invoice_no ?? null,
       e.supplier_barcode_no ?? null,

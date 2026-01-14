@@ -9,6 +9,7 @@ exports.mapRowToApi = (r) => ({
   weight: r.weight ?? null,
   length: r.length ?? null,
   box_unit: r.box_unit ?? null,
+  volume: r.volume ?? null,
 
   invoice_no: r.invoice_no ?? null,
 
