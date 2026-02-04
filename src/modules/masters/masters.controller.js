@@ -37,6 +37,21 @@ exports.list = async (req, res) => {
   }
 };
 
+exports.remove = async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!id) return res.status(400).json({ error: "id gerekiyor" });
+
+    const result = await service.removeIfAllowed(id);
+
+    // result = { deleted: true }
+    return res.json(result);
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.code || err.message, message: err.message });
+    console.error("Master silme hatası:", err);
+    return res.status(500).json({ error: "Master silinemedi" });
+  }
+};
 
 
 exports.create = async (req, res) => {

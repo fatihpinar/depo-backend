@@ -12,6 +12,34 @@ exports.getById = async (id) => {
   return repo.findJoinedById(id);
 };
 
+exports.removeIfAllowed = async (id) => {
+  const master = await repo.findJoinedById(id);
+  if (!master) {
+    const e = new Error("NOT_FOUND");
+    e.status = 404;
+    e.message = "Master bulunamadı.";
+    throw e;
+  }
+
+  const totalCount = await repo.countComponentsByMasterId(id);
+  if (totalCount > 0) {
+    const e = new Error("MASTER_HAS_COMPONENTS");
+    e.status = 409;
+    e.message = "Bu master'a bağlı component kaydı olduğu için silinemez.";
+    throw e;
+  }
+
+  const deleted = await repo.deleteOne(id);
+  if (!deleted) {
+    const e = new Error("DELETE_FAILED");
+    e.status = 500;
+    e.message = "Silme işlemi başarısız.";
+    throw e;
+  }
+
+  return { deleted: true };
+};
+
 
 // NULL ise "00", varsa display_code dönen yardımcı
 async function getDisplayCode(client, table, id, pad = 0, defaultCode = "00") {

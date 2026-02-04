@@ -22,7 +22,13 @@ exports.findJoinedById = async (id) => {
       lt.name         AS liner_type_name,
       lt.display_code AS liner_type_code,
       at.name         AS adhesive_type_name,
-      at.display_code AS adhesive_type_code
+      at.display_code AS adhesive_type_code,
+
+      (SELECT COUNT(*)::int
+       FROM components c
+       WHERE c.master_id = m.id
+      ) AS component_count
+
     FROM masters m
     JOIN product_types       pt ON pt.id = m.product_type_id
     LEFT JOIN carrier_types  ct ON ct.id = m.carrier_type_id
@@ -37,6 +43,7 @@ exports.findJoinedById = async (id) => {
   const { rows } = await pool.query(sql, [id]);
   return rows[0] || null;
 };
+
 
 /* =========================================================================
    MASTER LIST (Tanım listesi)
@@ -190,4 +197,22 @@ exports.updateOne = async (id, clean) => {
 
   const sql = `UPDATE masters SET ${fields.join(", ")} WHERE id = $${i}`;
   await pool.query(sql, params);
+};
+
+exports.countComponentsByMasterId = async (id, { statusId = null } = {}) => {
+  const params = [id];
+  let sql = `SELECT COUNT(*)::int AS cnt FROM components WHERE master_id = $1`;
+
+  if (statusId) {
+    params.push(statusId);
+    sql += ` AND status_id = $2`;
+  }
+
+  const { rows } = await pool.query(sql, params);
+  return rows[0]?.cnt ?? 0;
+};
+
+exports.deleteOne = async (id) => {
+  const { rowCount } = await pool.query(`DELETE FROM masters WHERE id = $1`, [id]);
+  return rowCount;
 };
