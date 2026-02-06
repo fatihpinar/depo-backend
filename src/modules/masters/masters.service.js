@@ -84,6 +84,28 @@ function numericToCode(value, totalDigits) {
   return normalized.padStart(totalDigits, "0");
 }
 
+function thicknessToCode(value) {
+  // boşsa: 0000
+  if (value === null || value === undefined || value === "") {
+    return "0000";
+  }
+
+  const s = String(value).trim();
+
+  // sadece sayı değilse hata ver
+  if (!/^\d+$/.test(s)) {
+    const e = new Error("THICKNESS_INVALID");
+    e.status = 400;
+    e.message = "Kalınlık sadece sayı olmalıdır.";
+    throw e;
+  }
+
+  // minimum 4 hane
+  return s.padStart(4, "0");
+}
+
+
+
 /* ========== CREATE (YENİ MİMARİ) ========== */
 exports.create = async (payload = {}) => {
   const {
@@ -164,13 +186,9 @@ exports.create = async (payload = {}) => {
     );
 
     // 2) Kalınlık ve yoğunluk kodları
+    const thicknessCode = thicknessToCode(thickness);
 
-    // thickness: kaç hane gelirse gelsin aynen (mm → µm dönüşümü FE’de zaten yapılıyor)
-    const thicknessCode = numericToCode(thickness, 0);       // 50 → "50", 10000 → "10000"
-
-    // density: istersen hâlâ 3 haneli kalsın
     const densityCode   = numericToCode(carrier_density, 3); // 20 → "020"
-
 
     // 3) Bimeks kodu (yeni kural)
     const bimeks_code = [
@@ -226,8 +244,8 @@ exports.create = async (payload = {}) => {
       carrier_type_id || null,
       supplier_id,
       supplier_product_code.trim(),
-      thickness !== undefined ? thickness : null,
-      carrier_density !== undefined ? carrier_density : null,
+      (thickness === "" || thickness === undefined) ? null : thickness,
+      (carrier_density === "" || carrier_density === undefined) ? null : carrier_density,
       carrier_color_id || null,
       liner_color_id || null,
       liner_type_id || null,
