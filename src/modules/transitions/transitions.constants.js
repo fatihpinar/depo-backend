@@ -1,4 +1,4 @@
-// ——— VAR OLANLAR (aynen dursun) ———
+
 const ITEM_TYPE = Object.freeze({ COMPONENT: "component", PRODUCT: "product" });
 const ACTION = Object.freeze({
   CREATE: "CREATE",

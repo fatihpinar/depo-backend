@@ -2,9 +2,11 @@
 const pool = require("../../core/db/index");
 const repo = require("./components.repository");
 const { mapRowToApi } = require("./components.mappers");
-const { recordTransitions, makeBatchId, applyStockBalancesForComponentTransitions } =
-  require("../transitions/transitions.service");
-
+const {
+  recordTransitions,
+  makeBatchId,
+  applyStockBalancesForComponentTransitions,
+} = require("../transitions/transitions.service");
 
 const { ITEM_TYPE, ACTION } = require("../transitions/transitions.constants");
 
@@ -29,7 +31,7 @@ const STATUS = {
 
 exports.list = async (filters) => {
   const rows = await repo.findMany(filters);
-  return rows.map(mapRowToApi);             // 👈 fonksiyon artık garanti var
+  return rows.map(mapRowToApi);
 };
 
 exports.getById = async (id) => {
@@ -42,7 +44,6 @@ exports.getById = async (id) => {
 exports.update = async (id, payload = {}, actorId = null) => {
   const client = await pool.connect();
 
-  // ✅ en üste al
   const getNumOrNull = (v) =>
     v === undefined || v === null || v === "" ? null : Number(v);
 
@@ -56,16 +57,15 @@ exports.update = async (id, payload = {}, actorId = null) => {
       throw e;
     }
 
-    // ✅ before geldikten sonra hesapla
     const nextBoxUnit =
       payload.box_unit !== undefined
         ? getNumOrNull(payload.box_unit)
         : getNumOrNull(before.box_unit);
 
-    
-    // master değişebilir → doğru unit için master_id belirle
     const nextMasterId =
-      payload.master_id !== undefined ? Number(payload.master_id) : Number(before.master_id);
+      payload.master_id !== undefined
+        ? Number(payload.master_id)
+        : Number(before.master_id);
 
     const { rows: ms } = await client.query(
       `SELECT id, stock_unit FROM masters WHERE id = $1`,
@@ -73,10 +73,14 @@ exports.update = async (id, payload = {}, actorId = null) => {
     );
     const stockUnit = (ms[0]?.stock_unit || "").toString().trim().toLowerCase();
 
-    // Barkod zorunluluğu (senin kuralın)
-    if (payload.status_id !== undefined && Number(payload.status_id) === STATUS.in_stock) {
+    if (
+      payload.status_id !== undefined &&
+      Number(payload.status_id) === STATUS.in_stock
+    ) {
       const planned =
-        payload.barcode !== undefined ? normalize(payload.barcode) : normalize(before.barcode);
+        payload.barcode !== undefined
+          ? normalize(payload.barcode)
+          : normalize(before.barcode);
       if (!planned) {
         const e = new Error("BARCODE_REQUIRED_FOR_IN_STOCK");
         e.status = 400;
@@ -85,7 +89,6 @@ exports.update = async (id, payload = {}, actorId = null) => {
       }
     }
 
-    // Barkod değişimi/çakışma/pool tüketme
     const { nextBarcode } = await ensureChangeAndConsume(client, {
       table: "components",
       id,
@@ -98,9 +101,17 @@ exports.update = async (id, payload = {}, actorId = null) => {
       },
     });
 
-    // Güncellenecek alanları topla (ortak alanlar)
     const fields = {};
-    for (const k of ["master_id", "status_id", "warehouse_id", "location_id", "notes", "invoice_no", "supplier_barcode_no", "entry_type",]) {
+    for (const k of [
+      "master_id",
+      "status_id",
+      "warehouse_id",
+      "location_id",
+      "notes",
+      "invoice_no",
+      "supplier_barcode_no",
+      "entry_type",
+    ]) {
       if (payload[k] !== undefined) fields[k] = payload[k];
     }
 
@@ -128,15 +139,24 @@ exports.update = async (id, payload = {}, actorId = null) => {
       fields.barcode = nextBarcode;
     }
 
-    // hangi değeri baz alacağız? payload varsa onu, yoksa before'u
-    const nextWidth = payload.width !== undefined ? getNumOrNull(payload.width) : getNumOrNull(before.width);
-    const nextHeight = payload.height !== undefined ? getNumOrNull(payload.height) : getNumOrNull(before.height);
-    const nextWeight = payload.weight !== undefined ? getNumOrNull(payload.weight) : getNumOrNull(before.weight);
-    const nextLength = payload.length !== undefined ? getNumOrNull(payload.length) : getNumOrNull(before.length);
-    const nextVolume = payload.volume !== undefined ? getNumOrNull(payload.volume) : getNumOrNull(before.volume);
+    const nextWidth =
+      payload.width !== undefined ? getNumOrNull(payload.width) : getNumOrNull(before.width);
+    const nextHeight =
+      payload.height !== undefined ? getNumOrNull(payload.height) : getNumOrNull(before.height);
+    const nextWeight =
+      payload.weight !== undefined ? getNumOrNull(payload.weight) : getNumOrNull(before.weight);
+    const nextLength =
+      payload.length !== undefined ? getNumOrNull(payload.length) : getNumOrNull(before.length);
+    const nextVolume =
+      payload.volume !== undefined ? getNumOrNull(payload.volume) : getNumOrNull(before.volume);
 
     if (stockUnit === "area") {
-      if (!Number.isFinite(nextWidth) || nextWidth <= 0 || !Number.isFinite(nextHeight) || nextHeight <= 0) {
+      if (
+        !Number.isFinite(nextWidth) ||
+        nextWidth <= 0 ||
+        !Number.isFinite(nextHeight) ||
+        nextHeight <= 0
+      ) {
         const e = new Error("DIMENSIONS_REQUIRED");
         e.status = 400;
         e.code = "DIMENSIONS_REQUIRED";
@@ -147,7 +167,6 @@ exports.update = async (id, payload = {}, actorId = null) => {
       fields.height = nextHeight;
       fields.area = nextWidth * nextHeight;
 
-      // diğer ölçüler temiz
       fields.weight = null;
       fields.length = null;
     } else if (stockUnit === "weight") {
@@ -160,13 +179,11 @@ exports.update = async (id, payload = {}, actorId = null) => {
       }
       fields.weight = nextWeight;
 
-      // area alanlarını temiz
       fields.width = null;
       fields.height = null;
       fields.area = null;
       fields.length = null;
-    }
-    else if (stockUnit === "box_unit") {
+    } else if (stockUnit === "box_unit") {
       if (!Number.isFinite(nextBoxUnit) || nextBoxUnit <= 0) {
         const e = new Error("BOX_UNIT_REQUIRED");
         e.status = 400;
@@ -175,7 +192,7 @@ exports.update = async (id, payload = {}, actorId = null) => {
         throw e;
       }
       fields.box_unit = nextBoxUnit;
-      } else if (stockUnit === "volume") {
+    } else if (stockUnit === "volume") {
       if (!Number.isFinite(nextVolume) || nextVolume <= 0) {
         const e = new Error("VOLUME_REQUIRED");
         e.status = 400;
@@ -185,15 +202,12 @@ exports.update = async (id, payload = {}, actorId = null) => {
       }
       fields.volume = nextVolume;
 
-      // diğer ölçüler temiz
       fields.width = null;
       fields.height = null;
       fields.area = null;
       fields.weight = null;
       fields.length = null;
-    }
-
-    else if (stockUnit === "length") {
+    } else if (stockUnit === "length") {
       if (!Number.isFinite(nextLength) || nextLength <= 0) {
         const e = new Error("LENGTH_REQUIRED");
         e.status = 400;
@@ -203,13 +217,11 @@ exports.update = async (id, payload = {}, actorId = null) => {
       }
       fields.length = nextLength;
 
-      // area alanlarını temiz
       fields.width = null;
       fields.height = null;
       fields.area = null;
       fields.weight = null;
     } else if (stockUnit === "unit") {
-      // ölçü yok → hepsini temizle (istersen mevcutları koru diyebilirsin)
       fields.width = null;
       fields.height = null;
       fields.area = null;
@@ -223,7 +235,6 @@ exports.update = async (id, payload = {}, actorId = null) => {
       throw e;
     }
 
-    // Onay bilgisi (senin kuralın)
     let isApproval = false;
     if (payload.status_id !== undefined) {
       const to = Number(payload.status_id);
@@ -232,7 +243,6 @@ exports.update = async (id, payload = {}, actorId = null) => {
     }
     if (isApproval && actorId) {
       fields.approved_by = actorId;
-      // approved_at repo.updateFields içinde NOW() ile set ediliyor
     }
 
     await repo.updateFields(client, id, fields);
@@ -248,10 +258,6 @@ exports.update = async (id, payload = {}, actorId = null) => {
   }
 };
 
-
-
-
-
 /* =============== BULK CREATE =============== */
 
 exports.bulkCreate = async (entries, { actorId } = {}) => {
@@ -259,28 +265,29 @@ exports.bulkCreate = async (entries, { actorId } = {}) => {
   try {
     await client.query("BEGIN");
 
-    const masterIds = [...new Set(entries.map(e => Number(e.master_id)).filter(Boolean))];
+    const masterIds = [...new Set(entries.map((e) => Number(e.master_id)).filter(Boolean))];
     const { rows: ms } = await client.query(
       `SELECT id, stock_unit FROM masters WHERE id = ANY($1)`,
       [masterIds]
     );
     const masterUnitById = new Map(
-      ms.map(x => [Number(x.id), (x.stock_unit || "").toString().trim().toLowerCase()])
+      ms.map((x) => [Number(x.id), (x.stock_unit || "").toString().trim().toLowerCase()])
     );
 
     const numOrNull = (v) => (v === undefined || v === null || v === "" ? null : Number(v));
-
 
     const prepared = entries.map((e, idx) => {
       const normalizeEntryType = (v) => {
         const x = (v ?? "").toString().trim().toLowerCase();
         if (!x) return null;
         if (x === "count" || x === "purchase") return x;
-        const e = new Error("VALIDATION_ERROR");
-        e.status = 400;
-        e.code = "VALIDATION_ERROR";
-        e.errors = [{ index: idx, field: "entry_type", message: "entry_type geçersiz (count|purchase)." }];
-        throw e;
+        const err = new Error("VALIDATION_ERROR");
+        err.status = 400;
+        err.code = "VALIDATION_ERROR";
+        err.errors = [
+          { index: idx, field: "entry_type", message: "entry_type geçersiz (count|purchase)." },
+        ];
+        throw err;
       };
 
       const master_id = Number(e.master_id);
@@ -323,7 +330,6 @@ exports.bulkCreate = async (entries, { actorId } = {}) => {
         out.width = width;
         out.height = height;
         out.area = width * height;
-
       } else if (stockUnit === "weight") {
         if (!Number.isFinite(weight) || weight <= 0) {
           const err = new Error("VALIDATION_ERROR");
@@ -333,7 +339,6 @@ exports.bulkCreate = async (entries, { actorId } = {}) => {
           throw err;
         }
         out.weight = weight;
-
       } else if (stockUnit === "length") {
         if (!Number.isFinite(length) || length <= 0) {
           const err = new Error("VALIDATION_ERROR");
@@ -343,8 +348,7 @@ exports.bulkCreate = async (entries, { actorId } = {}) => {
           throw err;
         }
         out.length = length;
-      }
-      else if (stockUnit === "box_unit") {
+      } else if (stockUnit === "box_unit") {
         if (!Number.isFinite(boxUnit) || boxUnit <= 0) {
           const err = new Error("VALIDATION_ERROR");
           err.status = 400;
@@ -353,8 +357,7 @@ exports.bulkCreate = async (entries, { actorId } = {}) => {
           throw err;
         }
         out.box_unit = boxUnit;
-        } 
-      else if (stockUnit === "volume") {
+      } else if (stockUnit === "volume") {
         if (!Number.isFinite(volume) || volume <= 0) {
           const err = new Error("VALIDATION_ERROR");
           err.status = 400;
@@ -363,11 +366,9 @@ exports.bulkCreate = async (entries, { actorId } = {}) => {
           throw err;
         }
         out.volume = volume;
-        } 
-      else if (stockUnit === "unit") {
+      } else if (stockUnit === "unit") {
         // ölçü yok → hepsi null
-        } 
-      else {
+      } else {
         const err = new Error("MASTER_STOCK_UNIT_INVALID");
         err.status = 400;
         err.code = "MASTER_STOCK_UNIT_INVALID";
@@ -378,7 +379,6 @@ exports.bulkCreate = async (entries, { actorId } = {}) => {
       return out;
     });
 
-    // barkod format/çakışma
     for (const e of prepared) {
       if (e.barcode) assertFormatAndKind(e.barcode, "component");
     }
@@ -407,7 +407,6 @@ exports.bulkCreate = async (entries, { actorId } = {}) => {
       });
     }
 
-    // transitions
     const UNIT_LABEL = "EA";
     const batchId = makeBatchId();
 
@@ -433,7 +432,6 @@ exports.bulkCreate = async (entries, { actorId } = {}) => {
 
     await client.query("COMMIT");
     return rows.map(mapRowToApi);
-
   } catch (err) {
     await client.query("ROLLBACK");
     throw err;
@@ -443,7 +441,7 @@ exports.bulkCreate = async (entries, { actorId } = {}) => {
 };
 
 /**
- * EXIT MANY — DOMAIN B CORRECT
+ * EXIT MANY — DOMAIN B CORRECT (+ MOVE FIX)
  */
 exports.exitMany = async (payload, actorId = null) => {
   let rows;
@@ -466,7 +464,11 @@ exports.exitMany = async (payload, actorId = null) => {
 
     for (const raw of rows) {
       const compId = Number(raw.component_id);
-      if (!compId) throw new Error("INVALID_COMPONENT_ID");
+      if (!compId) {
+        const e = new Error("INVALID_COMPONENT_ID");
+        e.status = 400;
+        throw e;
+      }
 
       const mode = raw.mode === "quantity" ? "quantity" : "unit";
       const target = raw.target === "stock" ? "stock" : "sale";
@@ -474,16 +476,19 @@ exports.exitMany = async (payload, actorId = null) => {
 
       // 1) Lock + fetch component
       const c = await repo.lockById(client, compId);
-      if (!c) throw new Error("COMPONENT_NOT_FOUND");
+      if (!c) {
+        const e = new Error("COMPONENT_NOT_FOUND");
+        e.status = 404;
+        throw e;
+      }
 
-      // 2) Fetch master.stock_unit
+      // 2) master.stock_unit (hem MOVE hem CONSUME için lazım)
       const { rows: msRows } = await client.query(
         `SELECT stock_unit FROM masters WHERE id=$1`,
         [c.master_id]
       );
       const stockUnit = (msRows[0]?.stock_unit || "").trim().toLowerCase();
 
-      // 3) Determine numeric field & current amount
       const numericField =
         stockUnit === "area"     ? "area" :
         stockUnit === "length"   ? "length" :
@@ -492,12 +497,94 @@ exports.exitMany = async (payload, actorId = null) => {
         stockUnit === "box_unit" ? "box_unit" :
         null;
 
-      const have = numericField ? Number(c[numericField] || 0) : 1; // unit model = always 1 satır
+      const have = numericField ? Number(c[numericField] || 0) : 1;
+
+      // ✅ MOVE: target=stock ise status DEĞİŞMEZ, sadece depo/lokasyon değişir
+      if (target === "stock") {
+        // Depo transferi satır bazlıdır; quantity mode kabul etmiyoruz
+        if (mode === "quantity") {
+          const e = new Error("INVALID_MODE_FOR_STOCK_TARGET");
+          e.status = 400;
+          e.code = "INVALID_MODE_FOR_STOCK_TARGET";
+          e.message = "Depo hedefinde quantity modu desteklenmez. Satır bazlı taşıma yap.";
+          throw e;
+        }
+
+        const toWarehouseId = Number(raw.warehouse_id || 0);
+        const toLocationId = Number(raw.location_id || 0);
+
+        if (!toWarehouseId || !toLocationId) {
+          const e = new Error("WAREHOUSE_LOCATION_REQUIRED");
+          e.status = 400;
+          e.code = "WAREHOUSE_LOCATION_REQUIRED";
+          e.message = "Depo hedefinde warehouse_id ve location_id zorunludur.";
+          throw e;
+        }
+
+        // Aynı yere taşıma → no-op (istersen yine de transition yazdırırsın)
+        if (toWarehouseId === Number(c.warehouse_id) && toLocationId === Number(c.location_id)) {
+          continue;
+        }
+
+        await repo.updateFields(client, compId, {
+          warehouse_id: toWarehouseId,
+          location_id: toLocationId,
+          // status_id dokunma
+        });
+
+        // Stock balance doğru güncellensin diye 2 transition:
+        // 1) FROM (-1)
+        transitions.push({
+          item_type: ITEM_TYPE.COMPONENT,
+          item_id: compId,
+          action: ACTION.MOVE,
+          qty_delta: -1,
+          unit: "EA",
+
+          from_status_id: c.status_id,
+          to_status_id: c.status_id,
+
+          from_warehouse_id: c.warehouse_id,
+          from_location_id: c.location_id,
+          to_warehouse_id: c.warehouse_id,
+          to_location_id: c.location_id,
+
+          context_type: "component_move",
+          context_id: null,
+          meta: numericField === "area"
+            ? { target: "stock", mode: "unit", consumed_area: have } // area_sum düşsün
+            : { target: "stock", mode: "unit", moved: true },
+        });
+
+        // 2) TO (+1)
+        transitions.push({
+          item_type: ITEM_TYPE.COMPONENT,
+          item_id: compId,
+          action: ACTION.MOVE,
+          qty_delta: +1,
+          unit: "EA",
+
+          from_status_id: c.status_id,
+          to_status_id: c.status_id,
+
+          from_warehouse_id: c.warehouse_id,
+          from_location_id: c.location_id,
+          to_warehouse_id: toWarehouseId,
+          to_location_id: toLocationId,
+
+          context_type: "component_move",
+          context_id: null,
+          meta: numericField === "area"
+            ? { target: "stock", mode: "unit", area: have } // area_sum artsın
+            : { target: "stock", mode: "unit", moved: true },
+        });
+
+        continue;
+      }
 
       // ========== UNIT EXIT ==========
       if (mode === "unit") {
-        const newStatus =
-          target === "sale" ? STATUS.sold : STATUS.used;
+        const newStatus = target === "sale" ? STATUS.sold : STATUS.used;
 
         const meta = {
           target,
@@ -511,18 +598,17 @@ exports.exitMany = async (payload, actorId = null) => {
         if (numericField) {
           meta[`consumed_${numericField}`] = have;
           meta[`remaining_${numericField}`] = 0;
+          if (numericField === "area") meta.consumed_area = have; // stock_balances için
         } else {
           meta.consumed_unit = 1;
           meta.remaining_unit = 0;
         }
 
-        // Apply component update
         await repo.updateFields(client, compId, {
           status_id: newStatus,
           ...(numericField ? { [numericField]: 0 } : {}),
         });
 
-        // Transition
         transitions.push({
           item_type: ITEM_TYPE.COMPONENT,
           item_id: compId,
@@ -571,10 +657,7 @@ exports.exitMany = async (payload, actorId = null) => {
       const left = have - qty;
       const fully = left === 0;
 
-      const newStatus =
-        fully
-          ? (target === "sale" ? STATUS.sold : STATUS.used)
-          : c.status_id;
+      const newStatus = fully ? (target === "sale" ? STATUS.sold : STATUS.used) : c.status_id;
 
       const meta = {
         target,
@@ -587,8 +670,8 @@ exports.exitMany = async (payload, actorId = null) => {
 
       meta[`consumed_${numericField}`] = qty;
       meta[`remaining_${numericField}`] = left;
+      if (numericField === "area") meta.consumed_area = qty; // stock_balances için
 
-      // Write component update
       await repo.updateFields(client, compId, {
         status_id: newStatus,
         [numericField]: left,
@@ -627,6 +710,3 @@ exports.exitMany = async (payload, actorId = null) => {
     client.release();
   }
 };
-
-
-
