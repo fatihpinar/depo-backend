@@ -42,6 +42,7 @@ exports.list = async ({
           WHEN m.stock_unit = 'area'     THEN COALESCE(c.area, 0)::float8
           WHEN m.stock_unit = 'weight'   THEN COALESCE(c.weight, 0)::float8
           WHEN m.stock_unit = 'length'   THEN COALESCE(c.length, 0)::float8
+          WHEN m.stock_unit = 'volume'   THEN COALESCE(c.volume, 0)::float8
           WHEN m.stock_unit = 'box_unit' THEN COALESCE(c.box_unit, 0)::float8
           WHEN m.stock_unit = 'unit'     THEN 1::float8
           ELSE COALESCE(c.area, 0)::float8
@@ -53,6 +54,7 @@ exports.list = async ({
         c.area::float8   AS area,
         c.weight::float8 AS weight,
         c.length::float8 AS length,
+        c.volume::float8 AS volume,
 
         st.id       AS status_id,
         COALESCE(st.label, st.code) AS status_label,
@@ -83,6 +85,7 @@ exports.list = async ({
         NULL::float8 AS area,
         NULL::float8 AS weight,
         NULL::float8 AS length,
+        NULL::float8 AS volume,
 
         st.id     AS status_id,
         COALESCE(st.label, st.code) AS status_label,
