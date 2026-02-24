@@ -49,7 +49,8 @@ exports.listPendingUnion = async (
       c.warehouse_id,
       c.location_id,
       c.updated_at,
-      NULL::text AS product_name 
+      NULL::text AS product_name,
+      c.supplier_barcode_no::text AS supplier_barcode_no
     FROM components c
     JOIN masters m ON m.id = c.master_id
     WHERE c.status_id = ${statusToList}
@@ -71,7 +72,8 @@ exports.listPendingUnion = async (
       p.warehouse_id,
       p.location_id,
       p.updated_at,
-      p.product_name AS product_name      -- 👈 BURASI NULL DEĞİL, p.product_name
+      p.product_name AS product_name,
+      NULL::text AS supplier_barcode_no   
     FROM products p
     WHERE p.status_id = ${statusToList}
   )
