@@ -75,11 +75,11 @@ exports.mapDetails = (r, components) => ({
   components: components.map((x) => ({
     id: x.component_id,
     barcode: x.barcode,
-    unit: x.unit,
+    unit: x.unit || null,
     consume_qty: Number(x.consume_qty),
     master: {
       id: x.comp_master_id,
-      name: x.comp_master_name || null,      // 👈 artık name
+      name: x.comp_master_name || null,
     },
     link_id: x.link_id,
   })),

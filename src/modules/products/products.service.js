@@ -1,7 +1,7 @@
 // src/modules/products/products.service.js
 const pool = require("../../core/db/index");
 const repo = require("./products.repository");
-const map  = require("./products.mappers");
+const map = require("./products.mappers");
 
 // transitions: dosyadan
 const { recordTransitions, makeBatchId } = require("../transitions/transitions.service");
@@ -24,6 +24,55 @@ const STATUS_IDS = {
   production: 6,
   screenprint: 7,
 };
+
+function normalizeUnitKey(unit) {
+  return String(unit || "")
+    .trim()
+    .toLowerCase()
+    .replace("²", "2");
+}
+
+function isEaUnit(unit) {
+  return normalizeUnitKey(unit) === "ea";
+}
+
+function isAreaUnit(unit) {
+  const u = normalizeUnitKey(unit);
+  return u === "area" || u === "m2" || u === "alan (m2)" || u === "alan (m²)";
+}
+
+function toPositiveNumberOrNull(v) {
+  if (v === undefined || v === null || v === "") return null;
+  const n = Number(v);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return n;
+}
+
+function round3(n) {
+  return Math.round(n * 1000) / 1000;
+}
+
+function calcAreaHeightFromWidth(area, width) {
+  const a = Number(area || 0);
+  const w = Number(width || 0);
+
+  if (!Number.isFinite(a) || a < 0) return null;
+  if (!Number.isFinite(w) || w <= 0) return null;
+
+  return round3(a / w);
+}
+
+function buildReturnNote(sourceBarcode, isFullReturn = false) {
+  if (isFullReturn) {
+    return sourceBarcode
+      ? `${sourceBarcode} geri döndü`
+      : "geri döndü";
+  }
+
+  return sourceBarcode
+    ? `${sourceBarcode}'ten depoya iade`
+    : "depoya iade";
+}
 
 // ---- ASSEMBLE yardımcıları ----
 
@@ -123,13 +172,13 @@ exports.update = async (id, payload = {}, actorId = null) => {
       id,
       kind: "product",
       incoming: payload.barcode,
-      current:  before.barcode,
+      current: before.barcode,
       conflictChecker: async (c, _t, code, productId) =>
         repo.isProductBarcodeTaken(c, code, productId),
     });
 
     // 3) Alan güncelle
-    const allowed = ["barcode","bimeks_code","product_name","status_id","warehouse_id","location_id","notes"];
+    const allowed = ["barcode", "bimeks_code", "product_name", "status_id", "warehouse_id", "location_id", "notes"];
     const fields = {};
     for (const k of allowed) if (payload[k] !== undefined) fields[k] = payload[k];
     if (payload.barcode !== undefined) fields.barcode = nextBarcode;
@@ -162,8 +211,8 @@ exports.update = async (id, payload = {}, actorId = null) => {
       });
     }
 
-    const whChanged  = payload.warehouse_id !== undefined && Number(before.warehouse_id || 0) !== Number(after.warehouse_id || 0);
-    const locChanged = payload.location_id  !== undefined && Number(before.location_id  || 0) !== Number(after.location_id  || 0);
+    const whChanged = payload.warehouse_id !== undefined && Number(before.warehouse_id || 0) !== Number(after.warehouse_id || 0);
+    const locChanged = payload.location_id !== undefined && Number(before.location_id || 0) !== Number(after.location_id || 0);
     if (whChanged || locChanged) {
       recs.push({
         item_type: ITEM_TYPE.PRODUCT,
@@ -172,9 +221,9 @@ exports.update = async (id, payload = {}, actorId = null) => {
         qty_delta: 0,
         unit: "EA",
         from_warehouse_id: before.warehouse_id || null,
-        from_location_id:  before.location_id  || null,
-        to_warehouse_id:   after.warehouse_id  || null,
-        to_location_id:    after.location_id   || null,
+        from_location_id: before.location_id || null,
+        to_warehouse_id: after.warehouse_id || null,
+        to_location_id: after.location_id || null,
       });
     }
 
@@ -366,40 +415,54 @@ exports.assemble = async (payload, actorId = null) => {
       }
 
       // ölçülü ürünler (area / length / weight / volume / box_unit)
-      if (requested > have) {
-        const e = new Error("CONSUME_GT_STOCK");
-        e.status = 409;
-        e.code = "CONSUME_GT_STOCK";
-        throw e;
-      }
+if (requested > have) {
+  const e = new Error("CONSUME_GT_STOCK");
+  e.status = 409;
+  e.code = "CONSUME_GT_STOCK";
+  throw e;
+}
 
-      const left = have - requested;
-      const fullyConsumed = left === 0;
-      const newStatus = fullyConsumed ? STATUS_IDS.used : comp.status_id;
+const left = round3(have - requested);
+const fullyConsumed = left === 0;
 
-      // stok düş
-      const params = [left];
-      let setClause = `${numericField} = $1`;
+// KISMİ TÜKETİM:
+// stok azalır, depoda kalır
+if (!fullyConsumed) {
+  if (numericField === "area") {
+    const currentWidth = Number(comp.width || 0);
+    if (!currentWidth || currentWidth <= 0) {
+      const e = new Error("AREA_WIDTH_REQUIRED");
+      e.status = 409;
+      e.code = "AREA_WIDTH_REQUIRED";
+      throw e;
+    }
 
-      if (fullyConsumed) {
-        params.push(newStatus);
-        setClause += ", status_id = $2";
-      }
+    const newHeight = calcAreaHeightFromWidth(left, currentWidth);
+    if (newHeight === null) {
+      const e = new Error("AREA_RECALC_FAILED");
+      e.status = 409;
+      e.code = "AREA_RECALC_FAILED";
+      throw e;
+    }
 
-      // updated_at
-      const idParamIndex = params.length + 1;
-      setClause += ", updated_at = NOW()";
-
-      params.push(comp.id);
-
-      await client.query(
-        `
-          UPDATE components
-             SET ${setClause}
-           WHERE id = $${idParamIndex}
-        `,
-        params
-      );
+    await repo.updateComponentFields(client, comp.id, {
+      quantity: left,
+      height: newHeight,
+      status_id: STATUS_IDS.in_stock,
+    });
+  } else {
+    await repo.updateComponentFields(client, comp.id, {
+      [numericField]: left,
+      status_id: STATUS_IDS.in_stock,
+    });
+  }
+} else {
+  // TAM TÜKETİM:
+  // miktarı bozma, sadece used yap
+  await repo.updateComponentFields(client, comp.id, {
+    status_id: STATUS_IDS.used,
+  });
+}
 
       // product_components kaydı
       await repo.insertProductComponentLink(client, {
@@ -462,54 +525,114 @@ exports.assemble = async (payload, actorId = null) => {
 
 exports.removeComponents = async (productId, items, actorId = null) => {
   const client = await pool.connect();
+
   try {
     await client.query("BEGIN");
 
     const product = await repo.lockProductExists(client, productId);
-    if (!product) { const e = new Error("PRODUCT_NOT_FOUND"); e.status = 404; throw e; }
+    if (!product) {
+      const e = new Error("PRODUCT_NOT_FOUND");
+      e.status = 404;
+      e.code = "PRODUCT_NOT_FOUND";
+      throw e;
+    }
 
-    const summary = { ok: true, processed: 0, createdScraps: [], returns: [] };
+    const summary = {
+      ok: true,
+      processed: 0,
+      createdScraps: [],
+      returns: [],
+    };
+
     const transitions = [];
     const batchId = makeBatchId();
 
     for (const raw of items) {
       const linkId = Number(raw.link_id || 0);
       const compId = Number(raw.component_id || 0);
+
       if (!linkId || !compId) {
-        const e = new Error("MISSING_FIELDS"); e.status = 400; e.code = "MISSING_FIELDS";
-        e.details = { link_id: !!linkId, component_id: !!compId }; throw e;
+        const e = new Error("MISSING_FIELDS");
+        e.status = 400;
+        e.code = "MISSING_FIELDS";
+        throw e;
       }
 
-      const row = await repo.lockLinkWithComponent(client, { linkId, productId, compId });
-      if (!row) { const e = new Error("LINK_NOT_FOUND"); e.status = 404; e.code = "LINK_NOT_FOUND"; throw e; }
-      const isEA = row.unit === "EA";
+      const row = await repo.lockLinkWithComponent(client, {
+        linkId,
+        productId,
+        compId,
+      });
 
+      if (!row) {
+        const e = new Error("LINK_NOT_FOUND");
+        e.status = 404;
+        e.code = "LINK_NOT_FOUND";
+        throw e;
+      }
+
+      const unit = row.unit;
+      const isEA = isEaUnit(unit);
+      const isArea = isAreaUnit(unit);
+      const remainingBindable = Number(row.consume_qty || 0);
+
+      // =========================
       // HURDA
+      // =========================
       if (raw.is_scrap === true) {
         const fireQty = isEA ? 1 : Number(raw.fire_qty || 0);
-        if (!isEA && fireQty <= 0) {
-          const e = new Error("INVALID_FIRE_QTY"); e.status = 400; e.code = "INVALID_FIRE_QTY"; throw e;
+
+        if (!isEA && (!Number.isFinite(fireQty) || fireQty <= 0)) {
+          const e = new Error("INVALID_FIRE_QTY");
+          e.status = 400;
+          e.code = "INVALID_FIRE_QTY";
+          throw e;
         }
 
-        const remainingBindable = Number(row.consume_qty);
         if (fireQty > remainingBindable) {
-          const e = new Error("FIRE_GT_CONSUMED"); e.status = 400; e.code = "FIRE_GT_CONSUMED";
-          e.details = { fireQty, remainingBindable }; throw e;
+          const e = new Error("FIRE_GT_CONSUMED");
+          e.status = 400;
+          e.code = "FIRE_GT_CONSUMED";
+          e.details = { fireQty, remainingBindable };
+          throw e;
+        }
+
+        let fireWidth = null;
+        let fireHeight = null;
+
+        if (isArea) {
+          fireWidth = Number(row.width || 0);
+          if (!fireWidth || fireWidth <= 0) {
+            const e = new Error("AREA_WIDTH_REQUIRED");
+            e.status = 409;
+            e.code = "AREA_WIDTH_REQUIRED";
+            throw e;
+          }
+
+          fireHeight = calcAreaHeightFromWidth(fireQty, fireWidth);
+          if (fireHeight === null) {
+            const e = new Error("AREA_RECALC_FAILED");
+            e.status = 409;
+            e.code = "AREA_RECALC_FAILED";
+            throw e;
+          }
         }
 
         const lostBarcode = await repo.generateLostBarcode(client);
+
         const scrapComp = await repo.createComponent(client, {
           master_id: row.master_id,
           barcode: lostBarcode,
-          unit: row.unit,
-          quantity: isEA ? 1 : fireQty,
+          unit,
+          quantity: fireQty,
+          width: fireWidth,
+          height: fireHeight,
           status_id: STATUS_IDS.damaged_lost,
-          warehouse_id: null, location_id: null,
+          warehouse_id: null,
+          location_id: null,
           is_scrap: true,
-          origin_component_id: row.component_id,
-          disposal_reason: (raw.reason || "").trim() || null,
           notes: (raw.reason || "").trim() || null,
-          created_by: actorId || null, 
+          created_by: actorId || null,
         });
 
         if (fireQty === remainingBindable) {
@@ -523,78 +646,100 @@ exports.removeComponents = async (productId, items, actorId = null) => {
         }
 
         transitions.push({
-          item_type: ITEM_TYPE.COMPONENT, item_id: scrapComp.id, action: ACTION.CREATE,
-          qty_delta: isEA ? 1 : fireQty, unit: row.unit,
-          to_status_id: STATUS_IDS.damaged_lost, context_type: "product", context_id: productId,
-          meta: { link_id: linkId, source_component_id: row.component_id, reason: (raw.reason || "").trim() || undefined }
+          item_type: ITEM_TYPE.COMPONENT,
+          item_id: scrapComp.id,
+          action: ACTION.CREATE,
+          qty_delta: fireQty,
+          unit: unit || "EA",
+          to_status_id: STATUS_IDS.damaged_lost,
+          context_type: "product",
+          context_id: productId,
+          meta: {
+            link_id: linkId,
+            source_component_id: row.component_id,
+            source_barcode: row.barcode || null,
+            reason: (raw.reason || "").trim() || undefined,
+            full_scrap: fireQty === remainingBindable,
+          },
         });
 
-        summary.createdScraps.push({ id: scrapComp.id, barcode: scrapComp.barcode });
+        summary.createdScraps.push({
+          id: scrapComp.id,
+          barcode: scrapComp.barcode,
+        });
+
         summary.processed += 1;
         continue;
       }
 
+      // =========================
       // IADE
-      const newBarcode = String((raw.new_barcode || "").trim()).toUpperCase();
+      // =========================
       const whId = Number(raw.warehouse_id || 0);
       const locId = Number(raw.location_id || 0);
+
       if (!whId || !locId) {
-        const e = new Error("WAREHOUSE_LOCATION_REQUIRED"); e.status = 400; e.code = "WAREHOUSE_LOCATION_REQUIRED"; throw e;
+        const e = new Error("WAREHOUSE_LOCATION_REQUIRED");
+        e.status = 400;
+        e.code = "WAREHOUSE_LOCATION_REQUIRED";
+        throw e;
       }
 
-      const remainingBindable = Number(row.consume_qty);
-      const wantReturn = isEA ? 1 : Number(raw.return_qty || remainingBindable);
-      if (!isEA && (wantReturn <= 0 || wantReturn > remainingBindable)) {
-        const e = new Error("INVALID_RETURN_QTY"); e.status = 400; e.code = "INVALID_RETURN_QTY";
-        e.details = { wantReturn, remainingBindable }; throw e;
+      const wantReturn = isEA ? 1 : Number(raw.return_qty || 0);
+
+      if (!isEA && (!Number.isFinite(wantReturn) || wantReturn <= 0)) {
+        const e = new Error("INVALID_RETURN_QTY");
+        e.status = 400;
+        e.code = "INVALID_RETURN_QTY";
+        throw e;
       }
 
-      if (newBarcode) {
-        assertFormatAndKind(newBarcode, "component");
-        const conflict = await repo.isComponentBarcodeTaken(client, newBarcode);
-        if (conflict) { const e = new Error("BARCODE_CONFLICT"); e.status = 409; e.code = "BARCODE_CONFLICT"; throw e; }
+      if (wantReturn > remainingBindable) {
+        const e = new Error("INVALID_RETURN_QTY");
+        e.status = 400;
+        e.code = "INVALID_RETURN_QTY";
+        e.details = { wantReturn, remainingBindable };
+        throw e;
+      }
 
-        const newComp = await repo.createComponent(client, {
-          master_id: row.master_id,
-          barcode: newBarcode,
-          unit: row.unit,
-          quantity: isEA ? 1 : wantReturn,
-          status_id: STATUS_IDS.pending,
-          warehouse_id: whId, location_id: locId,
-          created_by: actorId || null,
-        });
+      const isFullReturn = wantReturn === remainingBindable;
 
-        await assertAndConsume(client, {
-          code: newComp.barcode, kind: "component", refTable: "components", refId: newComp.id,
-        });
+      let returnWidth = null;
+      let returnHeight = null;
 
-        transitions.push({
-          item_type: ITEM_TYPE.COMPONENT, item_id: newComp.id, action: ACTION.RETURN,
-          qty_delta: isEA ? 1 : wantReturn, unit: row.unit,
-          to_status_id: STATUS_IDS.in_stock, to_warehouse_id: whId, to_location_id: locId,
-          context_type: "product", context_id: productId,
-          meta: { source_component_id: row.component_id, link_id: linkId, new_barcode: newComp.barcode }
-        });
-      } else {
-        if (isEA) {
-          await repo.updateComponentFields(client, row.component_id, {
-            status_id: STATUS_IDS.pending, warehouse_id: whId, location_id: locId
-          });
-        } else {
-          await repo.incrementComponentQtyAndSet(client, row.component_id, wantReturn, {
-            status_id: STATUS_IDS.pending, warehouse_id: whId, location_id: locId
-          });
+      if (isArea) {
+        returnWidth = Number(row.width || 0);
+        if (!returnWidth || returnWidth <= 0) {
+          const e = new Error("AREA_WIDTH_REQUIRED");
+          e.status = 409;
+          e.code = "AREA_WIDTH_REQUIRED";
+          throw e;
         }
 
-        transitions.push({
-          item_type: ITEM_TYPE.COMPONENT, item_id: row.component_id, action: ACTION.RETURN,
-          qty_delta: isEA ? 1 : wantReturn, unit: row.unit,
-          to_status_id: STATUS_IDS.pending, to_warehouse_id: whId, to_location_id: locId,
-          context_type: "product", context_id: productId,
-        });
+        returnHeight = calcAreaHeightFromWidth(wantReturn, returnWidth);
+        if (returnHeight === null) {
+          const e = new Error("AREA_RECALC_FAILED");
+          e.status = 409;
+          e.code = "AREA_RECALC_FAILED";
+          throw e;
+        }
       }
 
-      if (wantReturn === remainingBindable) {
+      const newComp = await repo.createComponent(client, {
+        master_id: row.master_id,
+        barcode: null,
+        unit,
+        quantity: wantReturn,
+        width: returnWidth,
+        height: returnHeight,
+        status_id: STATUS_IDS.pending,
+        warehouse_id: whId,
+        location_id: locId,
+        notes: buildReturnNote(row.barcode, isFullReturn),
+        created_by: actorId || null,
+      });
+
+      if (isFullReturn) {
         await repo.deleteProductComponentLink(client, linkId);
       } else {
         await repo.addAuditAndDecreaseLink(client, {
@@ -604,7 +749,31 @@ exports.removeComponents = async (productId, items, actorId = null) => {
         });
       }
 
-      summary.returns.push({ link_id: linkId, component_id: row.component_id, qty: wantReturn });
+      transitions.push({
+        item_type: ITEM_TYPE.COMPONENT,
+        item_id: newComp.id,
+        action: ACTION.RETURN,
+        qty_delta: wantReturn,
+        unit: unit || "EA",
+        to_status_id: STATUS_IDS.pending,
+        to_warehouse_id: whId,
+        to_location_id: locId,
+        context_type: "product",
+        context_id: productId,
+        meta: {
+          source_component_id: row.component_id,
+          source_barcode: row.barcode || null,
+          link_id: linkId,
+          full_return: isFullReturn,
+        },
+      });
+
+      summary.returns.push({
+        link_id: linkId,
+        component_id: row.component_id,
+        qty: wantReturn,
+      });
+
       summary.processed += 1;
     }
 
@@ -630,7 +799,12 @@ exports.addComponents = async (productId, items, actorId = null) => {
     await client.query("BEGIN");
 
     const product = await repo.lockProductExists(client, productId);
-    if (!product) { const e = new Error("PRODUCT_NOT_FOUND"); e.status = 404; throw e; }
+    if (!product) {
+      const e = new Error("PRODUCT_NOT_FOUND");
+      e.status = 404;
+      e.code = "PRODUCT_NOT_FOUND";
+      throw e;
+    }
 
     const links = [];
     const consumeTransitions = [];
@@ -638,47 +812,136 @@ exports.addComponents = async (productId, items, actorId = null) => {
     for (const raw of items) {
       const compId = Number(raw.component_id || 0);
       const reqQty = Number(raw.consume_qty || 0);
-      if (!compId) { const e = new Error("INVALID_COMPONENT_ID"); e.status = 400; throw e; }
+
+      if (!compId) {
+        const e = new Error("INVALID_COMPONENT_ID");
+        e.status = 400;
+        e.code = "INVALID_COMPONENT_ID";
+        throw e;
+      }
 
       const c = await repo.lockComponentById(client, compId);
-      if (!c) { const e = new Error("COMPONENT_NOT_FOUND"); e.status = 404; throw e; }
-      const isEA = c.unit === "EA";
+      if (!c) {
+        const e = new Error("COMPONENT_NOT_FOUND");
+        e.status = 404;
+        e.code = "COMPONENT_NOT_FOUND";
+        throw e;
+      }
+
+      const isEA = isEaUnit(c.unit);
+      const isArea = isAreaUnit(c.unit);
 
       if (isEA) {
-        if (c.status_id === STATUS_IDS.used) { const e = new Error("COMPONENT_ALREADY_USED"); e.status = 409; throw e; }
-        await repo.updateComponentFields(client, c.id, { status_id: STATUS_IDS.used });
-        const linkId = await repo.insertProductComponentLink(client, { product_id: productId, component_id: c.id, consume_qty: 1 });
+        if (c.status_id === STATUS_IDS.used) {
+          const e = new Error("COMPONENT_ALREADY_USED");
+          e.status = 409;
+          e.code = "COMPONENT_ALREADY_USED";
+          throw e;
+        }
+
+        await repo.updateComponentFields(client, c.id, {
+          status_id: STATUS_IDS.used,
+        });
+
+        const linkId = await repo.insertProductComponentLink(client, {
+          product_id: productId,
+          component_id: c.id,
+          consume_qty: 1,
+        });
+
         links.push({ id: linkId, component_id: c.id, consume_qty: 1 });
 
         consumeTransitions.push({
-          item_type: ITEM_TYPE.COMPONENT, item_id: c.id, action: ACTION.CONSUME,
-          qty_delta: -1, unit: c.unit,
-          from_warehouse_id: c.warehouse_id || null, from_location_id: c.location_id || null,
-          to_status_id: STATUS_IDS.used, context_type: "product", context_id: productId,
+          item_type: ITEM_TYPE.COMPONENT,
+          item_id: c.id,
+          action: ACTION.CONSUME,
+          qty_delta: -1,
+          unit: c.unit,
+          from_warehouse_id: c.warehouse_id || null,
+          from_location_id: c.location_id || null,
+          to_status_id: STATUS_IDS.used,
+          context_type: "product",
+          context_id: productId,
         });
-      } else {
-        if (reqQty <= 0) { const e = new Error("INVALID_CONSUME_QTY"); e.status = 400; throw e; }
-        const have = Number(c.quantity || 0);
-        if (reqQty > have) { const e = new Error("CONSUME_GT_STOCK"); e.status = 409; throw e; }
 
-        const left = have - reqQty;
-        if (left === 0) {
-          await repo.updateComponentFields(client, c.id, { quantity: 0, status_id: STATUS_IDS.used });
+        continue;
+      }
+
+      if (!Number.isFinite(reqQty) || reqQty <= 0) {
+        const e = new Error("INVALID_CONSUME_QTY");
+        e.status = 400;
+        e.code = "INVALID_CONSUME_QTY";
+        throw e;
+      }
+
+      const have = Number(c.quantity || 0);
+      if (reqQty > have) {
+        const e = new Error("CONSUME_GT_STOCK");
+        e.status = 409;
+        e.code = "CONSUME_GT_STOCK";
+        throw e;
+      }
+
+      const left = round3(have - reqQty);
+      const fullyConsumed = left === 0;
+
+      // KISMİ TÜKETİM: source stok azalır ama depoda kalır
+      if (!fullyConsumed) {
+        if (isArea) {
+          const currentWidth = Number(c.width || 0);
+          if (!currentWidth || currentWidth <= 0) {
+            const e = new Error("AREA_WIDTH_REQUIRED");
+            e.status = 409;
+            e.code = "AREA_WIDTH_REQUIRED";
+            throw e;
+          }
+
+          const newHeight = calcAreaHeightFromWidth(left, currentWidth);
+          if (newHeight === null) {
+            const e = new Error("AREA_RECALC_FAILED");
+            e.status = 409;
+            e.code = "AREA_RECALC_FAILED";
+            throw e;
+          }
+
+          await repo.updateComponentFields(client, c.id, {
+            quantity: left,
+            height: newHeight,
+            status_id: STATUS_IDS.in_stock,
+          });
         } else {
-          await repo.updateComponentFields(client, c.id, { quantity: left });
+          await repo.updateComponentFields(client, c.id, {
+            quantity: left,
+            status_id: STATUS_IDS.in_stock,
+          });
         }
-
-        const linkId = await repo.insertProductComponentLink(client, { product_id: productId, component_id: c.id, consume_qty: reqQty });
-        links.push({ id: linkId, component_id: c.id, consume_qty: reqQty });
-
-        consumeTransitions.push({
-          item_type: ITEM_TYPE.COMPONENT, item_id: c.id, action: ACTION.CONSUME,
-          qty_delta: -reqQty, unit: c.unit,
-          from_warehouse_id: c.warehouse_id || null, from_location_id: c.location_id || null,
-          to_status_id: left === 0 ? STATUS_IDS.used : STATUS_IDS.in_stock,
-          context_type: "product", context_id: productId,
+      } else {
+        // TAM TÜKETİM: miktarı bozma, sadece used yap
+        await repo.updateComponentFields(client, c.id, {
+          status_id: STATUS_IDS.used,
         });
       }
+
+      const linkId = await repo.insertProductComponentLink(client, {
+        product_id: productId,
+        component_id: c.id,
+        consume_qty: reqQty,
+      });
+
+      links.push({ id: linkId, component_id: c.id, consume_qty: reqQty });
+
+      consumeTransitions.push({
+        item_type: ITEM_TYPE.COMPONENT,
+        item_id: c.id,
+        action: ACTION.CONSUME,
+        qty_delta: -reqQty,
+        unit: c.unit,
+        from_warehouse_id: c.warehouse_id || null,
+        from_location_id: c.location_id || null,
+        to_status_id: fullyConsumed ? STATUS_IDS.used : STATUS_IDS.in_stock,
+        context_type: "product",
+        context_id: productId,
+      });
     }
 
     if (consumeTransitions.length) {

@@ -115,21 +115,22 @@ exports.findById = async (id) => {
 exports.findComponentsOfProduct = async (productId) => {
   const sql = `
     SELECT
-      pc.id            AS link_id,
-      c.id             AS component_id,
+      pc.id                  AS link_id,
+      c.id                   AS component_id,
       c.barcode,
-      c.area,                 -- komponentin mevcut alanı
-      c.area           AS quantity,      -- JS tarafını bozmamak için alias
+      c.area,
+      c.area                 AS quantity,
       pc.consume_qty,
-      mm.id            AS comp_master_id,
+      mm.id                  AS comp_master_id,
       mm.bimeks_product_name AS comp_master_name,
-      mm.stock_unit   AS comp_stock_unit
+      mm.stock_unit          AS unit
     FROM product_components pc
     JOIN components c ON c.id = pc.component_id
-    JOIN masters   mm ON mm.id = c.master_id
+    JOIN masters mm   ON mm.id = c.master_id
     WHERE pc.product_id = $1
     ORDER BY pc.id ASC
   `;
+
   const { rows } = await pool.query(sql, [productId]);
   return rows;
 };
@@ -143,17 +144,22 @@ exports.lockComponentById = async (client, id) => {
         c.id,
         c.master_id,
         c.barcode,
-        c.area,              -- gerçek kolon
-        c.area AS quantity,  -- eski kod için alias
+        c.width,
+        c.height,
+        c.area,
+        c.area AS quantity,
         c.status_id,
         c.warehouse_id,
-        c.location_id
+        c.location_id,
+        m.stock_unit AS unit
       FROM components c
+      JOIN masters m ON m.id = c.master_id
       WHERE c.id = $1
       FOR UPDATE
     `,
     [id]
   );
+
   return rows[0] || null;
 };
 
@@ -243,31 +249,6 @@ exports.insertProduct = async (client, p) => {
 };
 
 /* ---------- COMPONENT UPDATE HELPERS ---------- */
-
-/**
- * components tablosunu lock’lar.
- * Artık area kullanılıyor; JS tarafında quantity bekleniyorsa area alias’ı ile geliyor.
- */
-exports.lockComponentById = async (client, id) => {
-  const { rows } = await client.query(
-    `
-      SELECT
-        id,
-        area,
-        area AS quantity,
-        status_id,
-        warehouse_id,
-        location_id,
-        master_id
-      FROM components
-      WHERE id=$1
-      FOR UPDATE
-    `,
-    [id]
-  );
-  return rows[0] || null;
-};
-
 /**
  * Alan / durum vs. güncellemesi.
  * fields.quantity gelirse DB’de area kolonuna map’liyoruz.
@@ -316,15 +297,24 @@ exports.updateComponentFields = async (client, id, fields = {}) => {
  * Eski isim korunuyor ama quantity artık area kolonu:
  *  quantity = quantity + inc  ->  area = area + inc
  */
-exports.incrementComponentQtyAndSet = async (client, id, inc, alsoSet = {}) => {
-  const dbAlsoSet = {};
-  for (const k of Object.keys(alsoSet)) {
-    if (k === "quantity") dbAlsoSet["area"] = alsoSet[k];
-    else dbAlsoSet[k] = alsoSet[k];
+exports.incrementComponentQtyAndSet = async (client, id, inc, unit, alsoSet = {}) => {
+  const unitKey = String(unit || "").trim().toLowerCase().replace("²", "2");
+
+  let numericColumn = "area";
+
+  if (unitKey === "weight" || unitKey === "kg" || unitKey === "ağırlık (kg)") {
+    numericColumn = "weight";
+  } else if (unitKey === "length" || unitKey === "m" || unitKey === "uzunluk (m)") {
+    numericColumn = "length";
+  } else if (unitKey === "volume" || unitKey === "lt" || unitKey === "hacim (lt)") {
+    numericColumn = "volume";
+  } else if (unitKey === "box_unit" || unitKey === "ea" || unitKey === "koli içi adet (ea)") {
+    numericColumn = "box_unit";
   }
 
+  const dbAlsoSet = { ...alsoSet };
   const keys = Object.keys(dbAlsoSet);
-  const sets = [`area = area + $1`];
+  const sets = [`${numericColumn} = COALESCE(${numericColumn}, 0) + $1`];
   const params = [inc];
 
   keys.forEach((k, i) => {
@@ -333,6 +323,7 @@ exports.incrementComponentQtyAndSet = async (client, id, inc, alsoSet = {}) => {
   });
 
   params.push(id);
+
   await client.query(
     `UPDATE components
        SET ${sets.join(", ")}, updated_at=NOW()
@@ -375,20 +366,27 @@ exports.lockLinkWithComponent = async (client, { linkId, productId, compId }) =>
         pc.returned_qty AS returned_qty,
         pc.scrapped_qty AS scrapped_qty,
         c.id            AS component_id,
-        c.area          AS quantity,     -- alias
+        c.barcode,
+        c.width,
+        c.height,
+        c.area          AS quantity,
         c.area,
         c.master_id,
         c.status_id,
         c.warehouse_id,
         c.location_id,
-        'AREA'::text    AS unit          -- eski kod için dummy
+        m.stock_unit    AS unit
       FROM product_components pc
       JOIN components c ON c.id = pc.component_id
-      WHERE pc.id = $1 AND pc.product_id = $2 AND pc.component_id = $3
+      JOIN masters m    ON m.id = c.master_id
+      WHERE pc.id = $1
+        AND pc.product_id = $2
+        AND pc.component_id = $3
       FOR UPDATE
     `,
     [linkId, productId, compId]
   );
+
   return rows[0] || null;
 };
 
@@ -408,17 +406,45 @@ exports.isComponentBarcodeTaken = async (client, code) => {
 exports.createComponent = async (client, {
   master_id,
   barcode,
-  unit,        // artık kullanılmıyor ama imza bozulmasın diye duruyor
+  unit,
   quantity,
+  width = null,
+  height = null,
   status_id,
   warehouse_id = null,
   location_id = null,
   is_scrap = false,
-  origin_component_id = null,
-  disposal_reason = null,
   notes = null,
   created_by = null,
 }) => {
+  const unitKey = String(unit || "").trim().toLowerCase().replace("²", "2");
+
+  let area = null;
+  let weight = null;
+  let length = null;
+  let volume = null;
+  let box_unit = null;
+
+  if (unitKey === "area" || unitKey === "m2" || unitKey === "alan (m2)" || unitKey === "alan (m²)") {
+    area = quantity ?? null;
+  } else if (unitKey === "weight" || unitKey === "kg" || unitKey === "ağırlık (kg)") {
+    weight = quantity ?? null;
+    width = null;
+    height = null;
+  } else if (unitKey === "length" || unitKey === "m" || unitKey === "uzunluk (m)") {
+    length = quantity ?? null;
+    width = null;
+    height = null;
+  } else if (unitKey === "volume" || unitKey === "lt" || unitKey === "hacim (lt)") {
+    volume = quantity ?? null;
+    width = null;
+    height = null;
+  } else if (unitKey === "box_unit" || unitKey === "ea" || unitKey === "koli içi adet (ea)") {
+    box_unit = quantity ?? null;
+    width = null;
+    height = null;
+  }
+
   const cols = [
     "master_id",
     "barcode",
@@ -426,13 +452,17 @@ exports.createComponent = async (client, {
     "warehouse_id",
     "location_id",
     "is_scrap",
-    "origin_component_id",
-    "disposal_reason",
     "created_by",
     "created_at",
     "updated_at",
     "notes",
+    "width",
+    "height",
     "area",
+    "weight",
+    "length",
+    "volume",
+    "box_unit",
   ];
 
   const vals = [
@@ -442,19 +472,24 @@ exports.createComponent = async (client, {
     warehouse_id,
     location_id,
     is_scrap ? true : false,
-    origin_component_id,
-    disposal_reason,
     created_by,
     notes,
-    quantity ?? null,   // quantity -> area
+    width ?? null,
+    height ?? null,
+    area,
+    weight,
+    length,
+    volume,
+    box_unit,
   ];
 
   const { rows } = await client.query(
     `INSERT INTO components (${cols.join(",")})
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9, NOW(), NOW(), $10, $11)
-     RETURNING id, barcode`,
+     VALUES ($1,$2,$3,$4,$5,$6,$7, NOW(), NOW(), $8,$9,$10,$11,$12,$13,$14,$15)
+     RETURNING id, barcode, width, height, area, weight, length, volume, box_unit`,
     vals
   );
+
   return rows[0];
 };
 
